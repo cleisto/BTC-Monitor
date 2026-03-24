@@ -944,6 +944,7 @@ function BTCPowerLawMonitor() {
   });
 
   return (
+    <>
     <div className="min-h-screen bg-slate-950 text-white p-4" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
       <div className="max-w-3xl mx-auto space-y-4">
 
@@ -1213,6 +1214,7 @@ function BTCPowerLawMonitor() {
         <OscillationChart currentDate={currentDate} />
       </ChartModal>
     )}
+    </>
   );
 }
 
