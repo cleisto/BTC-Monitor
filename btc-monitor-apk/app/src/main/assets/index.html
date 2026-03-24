@@ -767,6 +767,109 @@ function CyclePhaseIndicator({ tNow, btcPrice, fairValue }) {
 }
 
 // ---------------------------------------------------------------------------
+// CHART MODAL (fullscreen zoom/pan overlay)
+// ---------------------------------------------------------------------------
+
+function ChartModal({ title, onClose, children }) {
+  const containerRef = React.useRef(null);
+  const transformRef = React.useRef({ scale: 1, x: 0, y: 0 });
+  const [tr, setTr] = React.useState({ scale: 1, x: 0, y: 0 });
+  const gestureRef = React.useRef({ isPinching: false, lastDist: 0, startX: 0, startY: 0 });
+
+  const applyTr = (newT) => { transformRef.current = newT; setTr(newT); };
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onStart = (e) => {
+      const t = transformRef.current;
+      const g = gestureRef.current;
+      if (e.touches.length === 2) {
+        g.isPinching = true;
+        g.lastDist = Math.hypot(
+          e.touches[1].clientX - e.touches[0].clientX,
+          e.touches[1].clientY - e.touches[0].clientY
+        );
+        g.pinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        g.pinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        g.pinchStartScale = t.scale;
+        g.pinchStartX = t.x;
+        g.pinchStartY = t.y;
+      } else if (e.touches.length === 1) {
+        g.isPinching = false;
+        g.startX = e.touches[0].clientX - t.x;
+        g.startY = e.touches[0].clientY - t.y;
+      }
+    };
+
+    const onMove = (e) => {
+      e.preventDefault();
+      const t = transformRef.current;
+      const g = gestureRef.current;
+      if (e.touches.length === 2) {
+        const dist = Math.hypot(
+          e.touches[1].clientX - e.touches[0].clientX,
+          e.touches[1].clientY - e.touches[0].clientY
+        );
+        const scaleDelta = dist / (g.lastDist || dist);
+        const newScale = Math.max(0.5, Math.min(8, t.scale * scaleDelta));
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        const newX = midX - (midX - t.x) * (newScale / t.scale);
+        const newY = midY - (midY - t.y) * (newScale / t.scale);
+        g.lastDist = dist;
+        applyTr({ scale: newScale, x: newX, y: newY });
+      } else if (e.touches.length === 1 && !g.isPinching) {
+        applyTr({ ...t, x: e.touches[0].clientX - g.startX, y: e.touches[0].clientY - g.startY });
+      }
+    };
+
+    const onEnd = (e) => {
+      if (e.touches.length < 2) gestureRef.current.isPinching = false;
+    };
+
+    el.addEventListener('touchstart', onStart, { passive: true });
+    el.addEventListener('touchmove', onMove, { passive: false });
+    el.addEventListener('touchend', onEnd, { passive: true });
+    return () => {
+      el.removeEventListener('touchstart', onStart);
+      el.removeEventListener('touchmove', onMove);
+      el.removeEventListener('touchend', onEnd);
+    };
+  }, []);
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: '#020617', zIndex: 1000, display: 'flex', flexDirection: 'column' }}>
+      <div style={{ padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #1e293b', background: '#0f172a', flexShrink: 0 }}>
+        <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: 14 }}>{title}</span>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {tr.scale !== 1 && (
+            <button onClick={() => applyTr({ scale: 1, x: 0, y: 0 })}
+              style={{ padding: '5px 11px', background: '#1e293b', color: '#94a3b8', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }}>
+              Reset
+            </button>
+          )}
+          <button onClick={onClose}
+            style={{ padding: '5px 14px', background: '#1e293b', color: '#f87171', border: '1px solid #7f1d1d', borderRadius: 8, fontSize: 16, fontWeight: 700, lineHeight: 1 }}>
+            ✕
+          </button>
+        </div>
+      </div>
+      <div ref={containerRef} style={{ flex: 1, overflow: 'hidden', position: 'relative', touchAction: 'none' }}>
+        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, padding: 12,
+          transform: `translate(${tr.x}px,${tr.y}px) scale(${tr.scale})`, transformOrigin: '0 0' }}>
+          {children}
+        </div>
+      </div>
+      <div style={{ padding: '7px', textAlign: 'center', color: '#334155', fontSize: 11, flexShrink: 0 }}>
+        2 Finger → Zoomen · 1 Finger → Verschieben
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // MAIN DASHBOARD
 // ---------------------------------------------------------------------------
 
@@ -777,6 +880,7 @@ function BTCPowerLawMonitor() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [fetchStatus, setFetchStatus] = useState('idle'); // 'idle' | 'loading' | 'ok' | 'error'
+  const [expandedChart, setExpandedChart] = useState(null); // null | 'powerlaw' | 'oscillation'
 
   const fetchPrice = useCallback(async () => {
     setFetchStatus('loading');
@@ -948,9 +1052,18 @@ function BTCPowerLawMonitor() {
         {/* Cycle Phase (Log-Periodic) */}
         {showOscillation && (
           <div className="bg-slate-900 rounded-xl p-4 border border-purple-900/30 space-y-3">
-            <h2 className="text-sm font-semibold text-purple-300">Zyklusposition (Diskrete Skaleninvarianz)</h2>
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-purple-300">Zyklusposition (Diskrete Skaleninvarianz)</h2>
+              <button onClick={() => setExpandedChart('oscillation')}
+                style={{ background: '#1e1b4b', border: '1px solid #4c1d95', borderRadius: 8, padding: '4px 10px', color: '#a78bfa', fontSize: 13, cursor: 'pointer' }}
+                title="Vergrößern">
+                ⤢
+              </button>
+            </div>
             <CyclePhaseIndicator tNow={tNow} btcPrice={btcPrice} fairValue={fairValue} />
-            <OscillationChart currentDate={currentDate} />
+            <div onClick={() => setExpandedChart('oscillation')} style={{ cursor: 'pointer' }}>
+              <OscillationChart currentDate={currentDate} />
+            </div>
             <p className="text-xs text-slate-600 text-center">
               Punkte = historische Residuen (ln(Preis/Median)) | Linie = log-periodisches Modell (ω, 2ω, 3ω, 4ω)
             </p>
@@ -959,8 +1072,17 @@ function BTCPowerLawMonitor() {
 
         {/* Power Law Chart */}
         <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
-          <h2 className="text-sm font-semibold text-slate-300 mb-2">Power Law Bänder (log-Skala)</h2>
-          <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} />
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-sm font-semibold text-slate-300">Power Law Bänder (log-Skala)</h2>
+            <button onClick={() => setExpandedChart('powerlaw')}
+              style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, padding: '4px 10px', color: '#94a3b8', fontSize: 13, cursor: 'pointer' }}
+              title="Vergrößern">
+              ⤢
+            </button>
+          </div>
+          <div onClick={() => setExpandedChart('powerlaw')} style={{ cursor: 'pointer' }}>
+            <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} />
+          </div>
         </div>
 
         {/* Take Profit Levels */}
@@ -1079,6 +1201,18 @@ function BTCPowerLawMonitor() {
         </div>
       </div>
     </div>
+
+    {/* Chart Modals */}
+    {expandedChart === 'powerlaw' && (
+      <ChartModal title="Power Law Bänder (log-Skala)" onClose={() => setExpandedChart(null)}>
+        <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} />
+      </ChartModal>
+    )}
+    {expandedChart === 'oscillation' && (
+      <ChartModal title="Zyklusposition (Diskrete Skaleninvarianz)" onClose={() => setExpandedChart(null)}>
+        <OscillationChart currentDate={currentDate} />
+      </ChartModal>
+    )}
   );
 }
 
