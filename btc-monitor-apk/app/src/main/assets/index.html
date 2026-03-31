@@ -4,12 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>BTC Power Law Monitor</title>
-  <!-- React 18 -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <!-- Babel Standalone (JSX transpiler) -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
@@ -23,7 +20,8 @@
   <script type="text/babel">
     const { useState, useMemo, useEffect, useCallback } = React;
 
-// BTC Power Law Monitor v5.3 — live Gold/BTC ratio chart
+// Drei-Schichten-Modell: Decay PL + Log-Periodische Oszillation (Amp-Decay) + Makro (PMI)
+// ±1σ Prediction Bands | Peak-Fenster (±3M MAE) | Gold/BTC Rotation Signal | Live CoinGecko
 
 // ============================================================================
 // BTC POWER LAW MONITOR v2
@@ -74,6 +72,13 @@ const SIMPLE_PL = {
   color: "#64748b",
   desc: "Konventionell, keine Skaleninvarianz",
 };
+
+// ---------------------------------------------------------------------------
+// PREDICTION BAND: ±1σ around oscillation-adjusted median
+// σ = 0.56 in ln-space (historical residuals vs full model)
+// σ shrinks over time: 0.57 (2013–19) → 0.32 (2022–26)
+// ---------------------------------------------------------------------------
+const MODEL_SIGMA = 0.5609;  // in ln(price) space
 
 // ---------------------------------------------------------------------------
 // LOG-PERIODIC OSCILLATION (Discrete Scale Invariance)
@@ -314,16 +319,23 @@ const fmtPrecise = (n) => {
 // CHART: Power Law Bands + Historical Prices + Oscillation
 // ---------------------------------------------------------------------------
 
-function PowerLawChart({ currentPrice, currentDate, showOscillation, showComparison }) {
+function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
   const tNow = daysSinceGenesis(currentDate);
   const startYear = 2013;
   const endYear = 2036;
   const POINTS = 500;
 
+  // Per-curve visibility toggles (all in one place)
+  const [layers, setLayers] = useState({
+    hist: true, median: true, floorCeil: true, simplePL: false,
+    oscMedian: true, sigmaBand: true, forecast: true,
+  });
+  const toggle = (key) => setLayers(prev => ({ ...prev, [key]: !prev[key] }));
+
   const currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
 
   const curves = useMemo(() => {
-    const result = { floor: [], median: [], ceiling: [], oscMedian: [], oscFloor: [], oscCeiling: [], simplePL: [] };
+    const result = { floor: [], median: [], ceiling: [], oscMedian: [], oscFloor: [], oscCeiling: [], simplePL: [], sigma1Hi: [], sigma1Lo: [] };
     for (let i = 0; i <= POINTS; i++) {
       const frac = i / POINTS;
       const year = startYear + (endYear - startYear) * frac;
@@ -333,13 +345,17 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation, showCompari
         const pt = { year, t };
         const oscVal = oscillationValue(t);
         const oscMul = Math.exp(oscVal);
+        const oscMedianPrice = powerLawPrice(t, MODELS.median) * oscMul;
         result.floor.push({ ...pt, price: powerLawPrice(t, MODELS.floor) });
         result.median.push({ ...pt, price: powerLawPrice(t, MODELS.median) });
         result.ceiling.push({ ...pt, price: powerLawPrice(t, MODELS.ceiling) });
-        result.oscMedian.push({ ...pt, price: powerLawPrice(t, MODELS.median) * oscMul });
+        result.oscMedian.push({ ...pt, price: oscMedianPrice });
         result.oscFloor.push({ ...pt, price: powerLawPrice(t, MODELS.floor) * oscMul });
         result.oscCeiling.push({ ...pt, price: powerLawPrice(t, MODELS.ceiling) * oscMul });
         result.simplePL.push({ ...pt, price: powerLawPrice(t, SIMPLE_PL) });
+        // ±1σ prediction band centered on osc-adjusted median
+        result.sigma1Hi.push({ ...pt, price: oscMedianPrice * Math.exp(MODEL_SIGMA) });
+        result.sigma1Lo.push({ ...pt, price: oscMedianPrice * Math.exp(-MODEL_SIGMA) });
       }
     }
     return result;
@@ -420,6 +436,7 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation, showCompari
   };
 
   return (
+    <>
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
       <rect width={W} height={H} fill="#0f172a" rx="8" />
 
@@ -440,30 +457,42 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation, showCompari
       ))}
 
       {/* Band fill (floor–ceiling) */}
-      <path d={bandPath} fill="#1e3a2a" opacity="0.2" />
+      {layers.floorCeil && <path d={bandPath} fill="#1e3a2a" opacity="0.2" />}
 
       {/* Forecast band (osc-adjusted floor–ceiling, future only) */}
-      {showOscillation && forecastBandPath && (
+      {showOscillation && layers.forecast && forecastBandPath && (
         <path d={forecastBandPath} fill="#7c3aed" opacity="0.25" />
       )}
 
+      {/* ±1σ prediction band around osc-adjusted median */}
+      {showOscillation && layers.sigmaBand && (() => {
+        const hiPts = curves.sigma1Hi.filter(d => d.price > 0 && isFinite(d.price));
+        const loPts = curves.sigma1Lo.filter(d => d.price > 0 && isFinite(d.price));
+        if (hiPts.length < 2 || loPts.length < 2) return null;
+        const sigmaPath = loPts.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join(' ')
+          + [...hiPts].reverse().map(d => `L${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join('') + 'Z';
+        return <path d={sigmaPath} fill="#06b6d4" opacity="0.10" />;
+      })()}
+
       {/* Model curves */}
-      <path d={curvePath(curves.floor)} fill="none" stroke="#22c55e" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
-      <path d={curvePath(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2" />
-      <path d={curvePath(curves.ceiling)} fill="none" stroke="#ef4444" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+      {layers.floorCeil && <>
+        <path d={curvePath(curves.floor)} fill="none" stroke="#22c55e" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+        <path d={curvePath(curves.ceiling)} fill="none" stroke="#ef4444" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+      </>}
+      {layers.median && <path d={curvePath(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2" />}
 
       {/* Comparison: Simple Power Law (no decay) */}
-      {showComparison && (
+      {layers.simplePL && (
         <path d={curvePath(curves.simplePL)} fill="none" stroke="#64748b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
       )}
 
       {/* Log-periodic oscillation on median */}
-      {showOscillation && (
+      {showOscillation && layers.oscMedian && (
         <path d={curvePath(curves.oscMedian)} fill="none" stroke="#c084fc" strokeWidth="1.5" opacity="0.8" />
       )}
 
       {/* Osc-adjusted floor and ceiling (future only, dashed) */}
-      {showOscillation && (
+      {showOscillation && layers.forecast && (
         <>
           <path d={curvePath(futureOnly(curves.oscFloor))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />
           <path d={curvePath(futureOnly(curves.oscCeiling))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />
@@ -471,7 +500,7 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation, showCompari
       )}
 
       {/* Historical BTC price */}
-      <path d={histPath} fill="none" stroke="#94a3b8" strokeWidth="1.2" opacity="0.7" />
+      {layers.hist && <path d={histPath} fill="none" stroke="#94a3b8" strokeWidth="1.2" opacity="0.7" />}
 
       {/* "Now" divider */}
       <line x1={cx} y1={PAD.top} x2={cx} y2={PAD.top + plotH} stroke="#f59e0b" strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
@@ -551,26 +580,42 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation, showCompari
         );
       })}
 
-      {/* Legend */}
-      <g transform={`translate(${PAD.left + 5}, ${PAD.top + 10})`}>
-        <line x1="0" y1="0" x2="14" y2="0" stroke="#94a3b8" strokeWidth="1.2" />
-        <text x="18" y="3" fill="#94a3b8" fontSize="8">BTC Preis (hist.)</text>
-        <line x1="0" y1="12" x2="14" y2="12" stroke="#f59e0b" strokeWidth="2" />
-        <text x="18" y="15" fill="#f59e0b" fontSize="8">Median (Decay PL)</text>
-        <line x1="0" y1="24" x2="14" y2="24" stroke="#22c55e" strokeWidth="1.2" strokeDasharray="4,3" />
-        <text x="18" y="27" fill="#22c55e" fontSize="8">Floor / Ceiling</text>
-        {showComparison && <>
-          <line x1="0" y1="36" x2="14" y2="36" stroke="#64748b" strokeWidth="1.5" strokeDasharray="6,4" />
-          <text x="18" y="39" fill="#64748b" fontSize="8">Einfaches PL (kein Decay)</text>
-        </>}
-        {showOscillation && <>
-          <line x1="0" y1={showComparison ? 48 : 36} x2="14" y2={showComparison ? 48 : 36} stroke="#c084fc" strokeWidth="1.5" />
-          <text x="18" y={showComparison ? 51 : 39} fill="#c084fc" fontSize="8">Osc. Median (gedämpft)</text>
-          <rect x="0" y={showComparison ? 57 : 45} width="14" height="8" fill="#7c3aed" opacity="0.3" rx="1" />
-          <text x="18" y={showComparison ? 64 : 52} fill="#a78bfa" fontSize="8">Forecast-Band (Osc.)</text>
-        </>}
-      </g>
+      {/* Legend - rendered as interactive HTML below */}
     </svg>
+    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 px-1">
+      {[
+        { key: 'hist', color: '#94a3b8', label: 'BTC Preis', line: true },
+        { key: 'median', color: '#f59e0b', label: 'Median (Decay)', line: true },
+        { key: 'floorCeil', color: '#22c55e', label: 'Floor / Ceiling', line: true, dashed: true },
+        { key: 'simplePL', color: '#64748b', label: 'Einfaches PL (Vgl.)', line: true, dashed: true },
+        ...(showOscillation ? [
+          { key: 'oscMedian', color: '#c084fc', label: 'Osc. Median', line: true },
+          { key: 'sigmaBand', color: '#06b6d4', label: '±1σ Band', band: true },
+          { key: 'forecast', color: '#a78bfa', label: 'Forecast-Band', band: true },
+        ] : []),
+      ].map(item => {
+        const active = layers[item.key];
+        return (
+          <button key={item.key} onClick={() => toggle(item.key)}
+            className="flex items-center gap-1 text-xs py-0.5 px-1.5 rounded transition-opacity"
+            style={{ opacity: active ? 1 : 0.35 }}>
+            {item.line ? (
+              <svg width="14" height="8" viewBox="0 0 14 8">
+                <line x1="0" y1="4" x2="14" y2="4" stroke={item.color}
+                  strokeWidth={item.key === 'median' ? 2 : 1.2}
+                  strokeDasharray={item.dashed ? '4,3' : 'none'} />
+              </svg>
+            ) : (
+              <svg width="14" height="8" viewBox="0 0 14 8">
+                <rect width="14" height="8" fill={item.color} opacity="0.4" rx="1" />
+              </svg>
+            )}
+            <span style={{ color: item.color }}>{item.label}</span>
+          </button>
+        );
+      })}
+    </div>
+    </>
   );
 }
 
@@ -1425,6 +1470,28 @@ function GoldBtcRatioChart({ ratioHistory, currentRatio, goldPrice, btcPrice }) 
 }
 
 // ---------------------------------------------------------------------------
+// COLLAPSIBLE SECTION
+// ---------------------------------------------------------------------------
+
+function Section({ title, children, defaultOpen = false, borderColor = 'border-slate-800', theme }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const bg = theme === 'light' ? 'bg-white' : 'bg-slate-900';
+  const hoverBg = theme === 'light' ? 'hover:bg-gray-50' : 'hover:bg-slate-800';
+  const titleColor = theme === 'light' ? 'text-gray-700' : 'text-slate-300';
+
+  return (
+    <div className={`${bg} rounded-xl border ${borderColor} overflow-hidden`}>
+      <button onClick={() => setOpen(!open)}
+        className={`w-full px-4 py-3 flex items-center justify-between ${hoverBg} transition-colors`}>
+        <h2 className={`text-sm font-semibold ${titleColor}`}>{title}</h2>
+        <span className={`text-slate-500 text-xs transition-transform ${open ? 'rotate-180' : ''}`}>▼</span>
+      </button>
+      {open && <div className="px-4 pb-4 space-y-3">{children}</div>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // MAIN DASHBOARD
 // ---------------------------------------------------------------------------
 
@@ -1433,11 +1500,16 @@ function BTCPowerLawMonitor() {
   const [goldPrice, setGoldPrice] = useState(3050);
   const [customDate, setCustomDate] = useState(() => new Date().toISOString().split('T')[0]);
   const [showOscillation, setShowOscillation] = useState(true);
-  const [showComparison, setShowComparison] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [fetchStatus, setFetchStatus] = useState('idle');
   const [ratioHistory, setRatioHistory] = useState([]);
+  const [theme, setTheme] = useState(() => {
+    if (typeof window !== 'undefined' && window.matchMedia) {
+      return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    }
+    return 'dark';
+  });
 
   const fetchPrice = useCallback(async () => {
     setFetchStatus('loading');
@@ -1570,21 +1642,36 @@ function BTCPowerLawMonitor() {
     };
   });
 
+  const isDark = theme === 'dark';
+  const bg = isDark ? 'bg-slate-950' : 'bg-gray-50';
+  const cardBg = isDark ? 'bg-slate-900' : 'bg-white';
+  const cardBorder = isDark ? 'border-slate-800' : 'border-gray-200';
+  const textPrimary = isDark ? 'text-white' : 'text-gray-900';
+  const textSecondary = isDark ? 'text-slate-400' : 'text-gray-500';
+  const textMuted = isDark ? 'text-slate-600' : 'text-gray-400';
+  const inputBg = isDark ? 'bg-slate-800 border-slate-700 text-white' : 'bg-gray-50 border-gray-300 text-gray-900';
+
   return (
-    <div className="min-h-screen bg-slate-950 text-white p-4" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+    <div className={`min-h-screen ${bg} ${textPrimary} p-4`} style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
       <div className="max-w-3xl mx-auto space-y-4">
 
         {/* Header */}
         <div className="text-center space-y-1">
-          <h1 className="text-2xl font-bold text-amber-400">BTC Power Law Monitor</h1>
-          <p className="text-slate-400 text-sm">Skaleninvariante Regression (w=1/t) + Log-Periodische Oszillation</p>
+          <div className="flex items-center justify-center gap-3">
+            <h1 className="text-2xl font-bold text-amber-400">BTC Power Law Monitor</h1>
+            <button onClick={() => setTheme(isDark ? 'light' : 'dark')}
+              className={`px-2 py-1 rounded-lg text-xs ${isDark ? 'bg-slate-800 text-slate-400' : 'bg-gray-200 text-gray-600'}`}>
+              {isDark ? '☀' : '🌙'}
+            </button>
+          </div>
+          <p className={`${textSecondary} text-sm`}>Skaleninvariante Regression (w=1/t) + Log-Periodische Oszillation</p>
         </div>
 
         {/* Input Controls */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
+        <div className={`${cardBg} rounded-xl p-4 border ${cardBorder}`}>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-2">
+              <label className={`text-xs ${textSecondary} uppercase tracking-wider flex items-center gap-2`}>
                 BTC Preis (USD)
                 {fetchStatus === 'ok' && <span className="text-green-400 text-xs">● Live</span>}
                 {fetchStatus === 'loading' && <span className="text-amber-400 text-xs">⟳</span>}
@@ -1592,13 +1679,13 @@ function BTCPowerLawMonitor() {
               </label>
               <input type="number" value={btcPrice}
                 onChange={(e) => { setBtcPrice(Number(e.target.value)); setAutoRefresh(false); }}
-                className="w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-lg font-mono text-white focus:outline-none focus:border-amber-500" />
+                className={`w-full mt-1 ${inputBg} rounded-lg px-3 py-2 text-lg font-mono focus:outline-none focus:border-amber-500 border`} />
             </div>
             <div>
-              <label className="text-xs text-slate-400 uppercase tracking-wider">Datum</label>
+              <label className={`text-xs ${textSecondary} uppercase tracking-wider`}>Datum</label>
               <input type="date" value={customDate}
                 onChange={(e) => { setCustomDate(e.target.value); setAutoRefresh(false); }}
-                className="w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-lg text-white focus:outline-none focus:border-amber-500" />
+                className={`w-full mt-1 ${inputBg} rounded-lg px-3 py-2 text-lg focus:outline-none focus:border-amber-500 border`} />
             </div>
           </div>
           <div className="mt-3 flex items-center gap-2 flex-wrap">
@@ -1606,11 +1693,6 @@ function BTCPowerLawMonitor() {
               onClick={() => setShowOscillation(!showOscillation)}
               className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${showOscillation ? 'bg-purple-900/50 text-purple-300 border border-purple-700' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
               Log-Periodisch {showOscillation ? 'AN' : 'AUS'}
-            </button>
-            <button
-              onClick={() => setShowComparison(!showComparison)}
-              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${showComparison ? 'bg-slate-600/50 text-slate-300 border border-slate-500' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
-              Vgl: Einfaches PL {showComparison ? 'AN' : 'AUS'}
             </button>
             <button
               onClick={() => { setAutoRefresh(!autoRefresh); if (!autoRefresh) fetchPrice(); }}
@@ -1653,6 +1735,22 @@ function BTCPowerLawMonitor() {
             </div>
           </div>
           <ValueGauge ratio={ratio} />
+          <div className="flex items-center gap-3 mt-2 pt-2" style={{ borderTop: '1px solid rgba(100,116,139,0.2)' }}>
+            <div className="text-center">
+              <div className="text-2xl font-bold font-mono" style={{ color: zone.color }}>
+                {ratio < 0.55 ? '3.0×' : ratio < 0.75 ? '2.0×' : ratio < 0.95 ? '1.5×' : ratio < 1.15 ? '1.0×' : ratio < 1.5 ? '0.5×' : ratio < 2.0 ? '0.25×' : '0×'}
+              </div>
+              <p className={`text-xs ${textMuted}`}>DCA-Multiplikator</p>
+            </div>
+            <div className={`flex-1 text-xs ${textMuted} grid grid-cols-3 gap-x-2 gap-y-0.5`}>
+              <span><span className="text-green-500">●</span> {'<'}55% → 3×</span>
+              <span><span className="text-green-400">●</span> 55-75% → 2×</span>
+              <span><span className="text-lime-300">●</span> 75-95% → 1.5×</span>
+              <span><span className="text-amber-400">●</span> 95-115% → 1×</span>
+              <span><span className="text-orange-400">●</span> 115-150% → 0.5×</span>
+              <span><span className="text-red-400">●</span> {'>'}150% → 0.25×</span>
+            </div>
+          </div>
         </div>
 
         {/* Current Values */}
@@ -1681,16 +1779,44 @@ function BTCPowerLawMonitor() {
           </div>
         </div>
 
-        {/* Cycle Phase (Log-Periodic) */}
+        {/* Projections (moved up for quick reference) */}
+        <div className={`${cardBg} rounded-xl p-4 border ${cardBorder}`}>
+          <h2 className={`text-sm font-semibold ${isDark ? 'text-slate-300' : 'text-gray-700'} mb-2`}>Fair-Value-Projektionen</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className={`${textMuted} text-xs uppercase`}>
+                  <th className="text-left py-1 px-2">Horizont</th>
+                  <th className="text-right py-1 px-2">Floor</th>
+                  <th className="text-right py-1 px-2">Median</th>
+                  {showOscillation && <th className="text-right py-1 px-2">Osc.</th>}
+                  <th className="text-right py-1 px-2">Ceiling</th>
+                </tr>
+              </thead>
+              <tbody>
+                {projections.map((p, i) => (
+                  <tr key={i} className={i % 2 === 0 ? (isDark ? 'bg-slate-800/30' : 'bg-gray-50') : ''}>
+                    <td className={`py-1 px-2 ${isDark ? 'text-slate-300' : 'text-gray-700'}`}>{p.label}</td>
+                    <td className="py-1 px-2 text-right font-mono text-green-400 text-xs">{fmt(p.floor)}</td>
+                    <td className="py-1 px-2 text-right font-mono text-amber-400 font-semibold text-xs">{fmt(p.median)}</td>
+                    {showOscillation && <td className="py-1 px-2 text-right font-mono text-purple-400 text-xs">{fmt(p.oscMedian)}</td>}
+                    <td className="py-1 px-2 text-right font-mono text-red-400 text-xs">{fmt(p.ceiling)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Cycle Phase (Log-Periodic) - collapsible */}
         {showOscillation && (
-          <div className="bg-slate-900 rounded-xl p-4 border border-purple-900/30 space-y-3">
-            <h2 className="text-sm font-semibold text-purple-300">Zyklusposition (Diskrete Skaleninvarianz)</h2>
+          <Section title="Zyklusposition (Diskrete Skaleninvarianz)" borderColor="border-purple-900/30" theme={theme}>
             <CyclePhaseIndicator tNow={tNow} btcPrice={btcPrice} fairValue={fairValue} />
             <OscillationChart currentDate={currentDate} />
-            <p className="text-xs text-slate-600 text-center">
+            <p className={`text-xs ${textMuted} text-center`}>
               Punkte = historische Residuen (ln(Preis/Median)) | Linie = log-periodisches Modell (ω, 2ω, 3ω, 4ω)
             </p>
-          </div>
+          </Section>
         )}
 
         {/* Cycle Timing Analysis */}
@@ -1785,15 +1911,7 @@ function BTCPowerLawMonitor() {
           const readinessLabel = readiness >= 0.8 ? 'Peak nahe' : readiness >= 0.6 ? 'Aufbauphase' : readiness >= 0.4 ? 'Früher Zyklus' : 'Akkumulationsphase';
 
           return (
-            <div className="bg-slate-900 rounded-xl p-4 border border-purple-900/30 space-y-3">
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-purple-300">Zyklus-Timing</h2>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold px-2 py-0.5 rounded-full" style={{ backgroundColor: readinessColor + '20', color: readinessColor }}>
-                    {metCount}/{conditions.length} Bedingungen · {readinessLabel}
-                  </span>
-                </div>
-              </div>
+            <Section title={`Zyklus-Timing — ${metCount}/${conditions.length} Bedingungen · ${readinessLabel}`} borderColor="border-purple-900/30" theme={theme}>
 
               {/* Peak window summary */}
               <div className="bg-slate-800/60 rounded-lg p-3 flex items-center justify-between">
@@ -1838,70 +1956,45 @@ function BTCPowerLawMonitor() {
                   abflachend — der typische Peak fällt in die Phase "hoch aber rollover". PMI = 50 allein ist keine Peak-Bedingung.
                 </p>
               </div>
-            </div>
+            </Section>
           );
         })()}
 
         {/* Power Law Chart */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
-          <h2 className="text-sm font-semibold text-slate-300 mb-2">Power Law Bänder (log-Skala)</h2>
-          <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} showComparison={showComparison} />
-        </div>
+        <Section title="Power Law Bänder (log-Skala)" theme={theme}>
+          <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} />
+        </Section>
 
         {/* Business Cycle / PMI Module */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-cyan-900/30 space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-cyan-300">Business Cycle — ISM PMI</h2>
-            <div className="flex items-center gap-3 text-xs">
-              {(() => {
-                const [, pmi] = getLatestPmi();
-                const color = pmi >= 50 ? '#22c55e' : '#ef4444';
-                const label = pmi >= 50 ? 'Expansion' : 'Kontraktion';
-                return (
-                  <>
-                    <span className="text-slate-400">PMI: <span className="font-mono font-bold" style={{ color }}>{pmi.toFixed(1)}</span></span>
-                    <span style={{ color }} className="font-medium">{label}</span>
-                    <span className="text-slate-400">PMI-adj. FV: <span className="text-cyan-400 font-mono">${fmt(getPmiAdjustedFairValue(pmi, fairValue))}</span></span>
-                  </>
-                );
-              })()}
-            </div>
+        <Section title="Business Cycle — ISM PMI" borderColor="border-cyan-900/30" theme={theme}>
+          <div className="flex items-center gap-3 text-xs mb-2">
+            {(() => {
+              const [, pmi] = getLatestPmi();
+              const color = pmi >= 50 ? '#22c55e' : '#ef4444';
+              const label = pmi >= 50 ? 'Expansion' : 'Kontraktion';
+              return (
+                <>
+                  <span className={textSecondary}>PMI: <span className="font-mono font-bold" style={{ color }}>{pmi.toFixed(1)}</span></span>
+                  <span style={{ color }} className="font-medium">{label}</span>
+                  <span className={textSecondary}>PMI-adj. FV: <span className="text-cyan-400 font-mono">${fmt(getPmiAdjustedFairValue(pmi, fairValue))}</span></span>
+                </>
+              );
+            })()}
           </div>
-
           <PmiOverlayChart btcPrice={btcPrice} currentDate={currentDate} />
           <PmiAdjustedFVChart btcPrice={btcPrice} currentDate={currentDate} />
-
-          <div className="text-xs text-slate-500 space-y-1 px-1">
-            <p>
-              <span className="text-cyan-400 font-semibold">Chart 1 — BTC vs. PMI:</span>{' '}
-              BTC-Preis (log, linke Achse) und ISM Manufacturing PMI (rechte Achse) seit 2013.
-              Grün = PMI über 50 (Wirtschaft expandiert), Rot = PMI unter 50 (Kontraktion).
-              Historisch korrelieren BTC-Bullphasen mit PMI {'>'} 50. Der aktuelle PMI um 50
-              signalisiert eine neutrale bis leicht kontraktive Phase.
-            </p>
-            <p>
-              <span className="text-cyan-400 font-semibold">Chart 2 — PMI-adjustierter Fair Value:</span>{' '}
-              Die cyan-farbene Linie zeigt den Decay-PL-Median korrigiert um den Wirtschaftszyklus.
-              Regression (R²=0.51): Jeder PMI-Punkt über 50 hebt den Fair Value um ~3,7%.
-              Bei PMI=48 liegt der adjustierte FV unter dem Modell-Median — das erklärt einen Teil der
-              aktuellen Unterbewertung. Steigt der PMI über 55, dreht der Makro-Wind zugunsten von BTC.
-            </p>
-            <p className="text-slate-600 italic">
-              ISM PMI: monatlich, Quelle: Institute for Supply Management. R² der Regression steigt
-              von 0.18 (2010–2018) auf 0.51 (2018–2025) — BTC koppelt zunehmend an den Wirtschaftszyklus.
-            </p>
+          <div className={`text-xs ${textMuted} space-y-1`}>
+            <p><span className="text-cyan-400 font-semibold">Chart 1:</span> BTC vs. PMI. Grün = PMI {'>'} 50 (Expansion), Rot = PMI {'<'} 50.</p>
+            <p><span className="text-cyan-400 font-semibold">Chart 2:</span> PMI-adjustierter FV. R²=0.51: Jeder PMI-Punkt ≈ 3.7% auf FV.</p>
           </div>
-        </div>
+        </Section>
 
         {/* Gold/BTC Ratio */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-amber-900/30 space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-amber-300">Gold / BTC Ratio (90 Tage)</h2>
-            <div className="flex items-center gap-3 text-xs">
-              <span className="text-slate-400">Gold: <span className="text-amber-400 font-mono">${goldPrice.toLocaleString()}</span></span>
-              <span className="text-slate-400">BTC: <span className="text-white font-mono">${btcPrice.toLocaleString()}</span></span>
-              <span className="text-slate-400">1 oz = <span className="text-amber-300 font-mono">{(goldPrice / btcPrice).toFixed(4)}</span> BTC</span>
-            </div>
+        <Section title="Gold / BTC Ratio (90 Tage)" borderColor="border-amber-900/30" theme={theme}>
+          <div className="flex items-center gap-3 text-xs mb-2">
+            <span className={textSecondary}>Gold: <span className="text-amber-400 font-mono">${goldPrice.toLocaleString()}</span></span>
+            <span className={textSecondary}>BTC: <span className={`${textPrimary} font-mono`}>${btcPrice.toLocaleString()}</span></span>
+            <span className={textSecondary}>1 oz = <span className="text-amber-300 font-mono">{(goldPrice / btcPrice).toFixed(4)}</span> BTC</span>
           </div>
           <GoldBtcRatioChart
             ratioHistory={ratioHistory}
@@ -1909,163 +2002,79 @@ function BTCPowerLawMonitor() {
             goldPrice={goldPrice}
             btcPrice={btcPrice}
           />
-          <div className="text-xs text-slate-500 space-y-1 px-1">
-            <p>
-              <span className="text-amber-400 font-semibold">Lesehilfe:</span>{' '}
-              Die Ratio zeigt den Preis einer Unze Gold geteilt durch den BTC-Preis.
-              Eine <span className="text-green-400">fallende</span> Ratio bedeutet: BTC gewinnt an Kaufkraft
-              gegenüber Gold — typisch in Bullphasen. Eine <span className="text-red-400">steigende</span> Ratio
-              bedeutet: Gold schlägt BTC — typisch in Korrekturen oder wenn Gold als Safe Haven gefragt ist.
-            </p>
-            <p>
-              <span className="text-amber-400 font-semibold">Kontext-Signal:</span>{' '}
-              Historisch beginnen Gold-Bullruns vor BTC-Bullruns (Lead-Effekt).
-              Wenn Gold stark steigt und die Ratio steigt, kann das ein Vorlaufsignal sein:
-              Die monetären Bedingungen für einen BTC-Bullrun sind da, aber BTC hat noch
-              nicht reagiert. Eine Trendwende der Ratio nach unten bestätigt, dass BTC aufholt.
-            </p>
+          <div className={`text-xs ${textMuted} space-y-1`}>
+            <p><span className="text-amber-400 font-semibold">Lesehilfe:</span> Fallende Ratio = BTC gewinnt vs. Gold (Bullphase). Steigende Ratio = Gold schlägt BTC (Korrektur/Safe Haven).</p>
+            <p><span className="text-amber-400 font-semibold">Kontext:</span> Gold-Bullruns gehen BTC-Bullruns voraus. Trendwende der Ratio nach unten bestätigt BTC-Aufholjagd.</p>
           </div>
-        </div>
+        </Section>
 
         {/* Gold → BTC Rotation Signal */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-emerald-900/30 space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-emerald-300">Makro-Regime: Gold → BTC Rotation</h2>
-            <span className="text-xs text-slate-500">7T-Return-Differenz (BTC − Gold)</span>
-          </div>
+        <Section title="Makro-Regime: Gold → BTC Rotation" borderColor="border-emerald-900/30" theme={theme}>
           <RotationSignalChart ratioHistory={ratioHistory} goldPrice={goldPrice} btcPrice={btcPrice} />
-          <div className="text-xs text-slate-500 space-y-1 px-1">
+          <div className={`text-xs ${textMuted} space-y-1`}>
             <p>
-              <span className="font-semibold" style={{ color: '#f97316' }}>■ Risk-On:</span>{' '}
-              BTC steigt stärker als Gold — Risikoapetit treibt. Typisch bei starker Wirtschaft, kein Krisenmodus.
-              {' '}<span className="font-semibold" style={{ color: '#22c55e' }}>■ Rotation → BTC:</span>{' '}
-              BTC outperformt, weil <em>Gold fällt</em> — Kapital verlässt Safe Haven und kehrt in Risk Assets zurück.
-              Das seltenste und operativ wertvollste Signal.
+              <span className="font-semibold" style={{ color: '#f97316' }}>■ Risk-On:</span> BTC steigt stärker als Gold.
+              {' '}<span className="font-semibold" style={{ color: '#22c55e' }}>■ Rotation → BTC:</span> Gold fällt, BTC hält — das wertvollste Signal.
             </p>
             <p>
-              <span className="font-semibold" style={{ color: '#ef4444' }}>■ Risk-Off:</span>{' '}
-              BTC fällt stärker als Gold — aktive Flucht aus Risk Assets. Typisch bei Rezessionsangst, Liquiditätskrise.
-              {' '}<span className="font-semibold" style={{ color: '#eab308' }}>■ Safe Haven:</span>{' '}
-              Gold steigt stärker als BTC — Kapital flieht in Sicherheit. Typisch bei Krieg, Ölpreis-Schock, Dollar-Schwäche.
-            </p>
-            <p className="text-slate-600 italic">
-              Wechselt das Signal von Rot/Blau (Risk-Off) direkt zu Grün (Rotation), ist das historisch ein
-              Frühindikator für eine BTC-Rally: Der Safe Haven wird aufgelöst, bevor BTC selbst anzieht.
+              <span className="font-semibold" style={{ color: '#ef4444' }}>■ Risk-Off:</span> BTC fällt stärker als Gold.
+              {' '}<span className="font-semibold" style={{ color: '#eab308' }}>■ Safe Haven:</span> Gold steigt stärker — Flucht in Sicherheit.
             </p>
           </div>
-        </div>
+        </Section>
 
         {/* Take Profit Levels */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
-          <h2 className="text-sm font-semibold text-slate-300 mb-3">Take-Profit Trigger</h2>
+        <Section title="Take-Profit Trigger" theme={theme}>
           <div className="space-y-1.5">
             {takeProfits.map((tp, i) => {
               const isActive = btcPrice >= tp.price;
               const isNext = i > 0 && btcPrice < tp.price && btcPrice >= takeProfits[i - 1].price;
               return (
-                <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm ${isActive ? 'bg-red-900/30 border border-red-800/50' : isNext ? 'bg-amber-900/20 border border-amber-800/30' : 'bg-slate-800/50'}`}>
+                <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm ${isActive ? 'bg-red-900/30 border border-red-800/50' : isNext ? 'bg-amber-900/20 border border-amber-800/30' : (isDark ? 'bg-slate-800/50' : 'bg-gray-50')}`}>
                   <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-red-400' : 'bg-slate-600'}`} />
-                    <span className={isActive ? 'text-red-300' : 'text-slate-400'}>{tp.level}</span>
+                    <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-red-400' : (isDark ? 'bg-slate-600' : 'bg-gray-300')}`} />
+                    <span className={isActive ? 'text-red-300' : textSecondary}>{tp.level}</span>
                   </div>
                   <div className="flex items-center gap-4">
-                    <span className="font-mono text-slate-300">{fmt(tp.price)}</span>
-                    <span className="text-xs text-slate-500 w-12 text-right">{tp.pct}</span>
+                    <span className={`font-mono ${isDark ? 'text-slate-300' : 'text-gray-700'}`}>{fmt(tp.price)}</span>
+                    <span className={`text-xs ${textMuted} w-12 text-right`}>{tp.pct}</span>
                   </div>
                 </div>
               );
             })}
           </div>
-        </div>
-
-        {/* Projections */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
-          <h2 className="text-sm font-semibold text-slate-300 mb-3">Fair-Value-Projektionen</h2>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-slate-500 text-xs uppercase">
-                  <th className="text-left py-1.5 px-2">Horizont</th>
-                  <th className="text-right py-1.5 px-2">Floor</th>
-                  <th className="text-right py-1.5 px-2">Median</th>
-                  {showOscillation && <th className="text-right py-1.5 px-2">Osc. Median</th>}
-                  <th className="text-right py-1.5 px-2">Ceiling</th>
-                </tr>
-              </thead>
-              <tbody>
-                {projections.map((p, i) => (
-                  <tr key={i} className={i % 2 === 0 ? 'bg-slate-800/30' : ''}>
-                    <td className="py-1.5 px-2 text-slate-300">{p.label}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-green-400">{fmt(p.floor)}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-amber-400 font-semibold">{fmt(p.median)}</td>
-                    {showOscillation && (
-                      <td className="py-1.5 px-2 text-right font-mono text-purple-400">{fmt(p.oscMedian)}</td>
-                    )}
-                    <td className="py-1.5 px-2 text-right font-mono text-red-400">{fmt(p.ceiling)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* DCA Multiplier */}
-        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
-          <h2 className="text-sm font-semibold text-slate-300 mb-3">DCA-Multiplikator</h2>
-          <div className="flex items-center gap-4">
-            <div className="text-center flex-1">
-              <div className="text-3xl font-bold font-mono" style={{ color: zone.color }}>
-                {ratio < 0.55 ? '3.0×' : ratio < 0.75 ? '2.0×' : ratio < 0.95 ? '1.5×' : ratio < 1.15 ? '1.0×' : ratio < 1.5 ? '0.5×' : ratio < 2.0 ? '0.25×' : '0×'}
-              </div>
-              <p className="text-xs text-slate-500 mt-1">des Basis-DCA-Betrags</p>
-            </div>
-            <div className="flex-1 text-sm text-slate-400 space-y-0.5">
-              <p><span className="text-green-500">●</span> {'<'}55% → 3× (Deep Value)</p>
-              <p><span className="text-green-400">●</span> 55-75% → 2× (Akkumulation)</p>
-              <p><span className="text-lime-300">●</span> 75-95% → 1.5× (Unterbewertet)</p>
-              <p><span className="text-amber-400">●</span> 95-115% → 1× (Fair Value)</p>
-              <p><span className="text-orange-400">●</span> 115-150% → 0.5× (Überbew.)</p>
-              <p><span className="text-red-400">●</span> {'>'}150% → 0.25× (Zyklusreife)</p>
-            </div>
-          </div>
-        </div>
+        </Section>
 
         {/* Model Documentation */}
-        <div className="bg-slate-800/50 rounded-xl p-4 text-xs text-slate-500 space-y-2">
-          <p className="font-semibold text-slate-400">Zwei-Schichten-Modell</p>
-          <p className="text-slate-400 italic">
-            ln(P) = [a + (β − d·ln(t))·ln(t)] + Σ Cₙ·cos(nω·ln(t) + φₙ)
+        <div className={`${isDark ? 'bg-slate-800/50' : 'bg-gray-100'} rounded-xl p-4 text-xs ${textMuted} space-y-2`}>
+          <p className={`font-semibold ${textSecondary}`}>Drei-Schichten-Modell + Makro-Overlay</p>
+          <p className={`${textSecondary} italic`}>
+            ln(P) = [a + (β − d·ln(t))·ln(t)] + Σ Cₙ · t^(-δ) · cos(nω·ln(t) + φₙ) + f(PMI)
           </p>
           <p>
             <span className="text-amber-500 font-semibold">Schicht 1 — Trend (Decay Power Law):</span>{' '}
             Skaleninvariante Quantil-Regression (τ=0.50) mit Jacobian w(t)=1/t.
-            8 unabhängige Decay-Funktionen konvergieren auf d≈0.029 am Median
-            und ~$101k Fair Value heute. Konstanter Exponent (d=0) wird verworfen —
-            außer am Floor, wo Support beschleunigt (d{'<'}0). Simpsons Paradox:
-            der Aggregat-Exponent erscheint stabil, aber Quantilstruktur zeigt Decay oben,
-            Beschleunigung unten. Kalibriert: ~$101k heute, ~$375k in 5J, ~$1.07M in 10J.
+            8 unabhängige Decay-Funktionen konvergieren auf d≈0.029 am Median.
+            Kalibriert: $101k Median, $56k Floor, $160k Ceiling.
           </p>
           <p>
-            <span className="text-green-500">Floor (Q1):</span> d=0, β=5.10 — konsistent ~45% unter Median.{' '}
-            <span className="text-red-500">Ceiling:</span> d=0.045, β=5.90 — komprimiert über Zeit, ~60% über Median.
+            <span className="text-purple-500 font-semibold">Schicht 2 — Oszillation (Amplituden-Decay):</span>{' '}
+            osc(t) = Σ Cₙ·t^(-0.684)·cos(nω·ln(t)+φₙ). ω=8.894 (λ≈2.03).
+            Fit: 5.704 tägliche Datenpunkte. R²=0.605.
+            ±1σ Prediction Band (σ=0.56 ln-Raum). C = K·ln(Λ) ≈ 3.96 (Coupling Constant).
           </p>
           <p>
-            <span className="text-purple-500 font-semibold">Schicht 2 — Oszillation (mit Amplituden-Decay):</span>{' '}
-            osc(t) = Σ Cₙ · t^(-δ) · cos(nω·ln(t)+φₙ). ω=8.894 fixiert (λ=2.027),
-            δ=0.684 per Grid-Search. 5.704 tägliche Datenpunkte.
-            R²=0.605 (+12pp vs. ohne Amplituden-Decay). Effektive Amplitude
-            der Fundamentale schrumpft: 0.62 dex (2011) → 0.22 (2017) → 0.14 (2025) → 0.12 (2028).
-            Peak-Projektion 2028: ~$265k statt ~$537k ohne Dämpfung.
+            <span className="text-cyan-500 font-semibold">Schicht 3 — Makro (ISM PMI):</span>{' '}
+            Regression BTC-Residual auf PMI: R²=0.51 (2018–25). Jeder PMI-Punkt ≈ 3.7% auf FV.
+            Peak-Bedingung: PMI ≥ 55 (alle 4 hist. Peaks). Gold/BTC-Rotation als Regime-Indikator.
           </p>
-          <p className="text-amber-500">
-            <span className="font-semibold">⚠ Divergenz heute:</span>{' '}
-            Modell sagt +11% vs. Trend, Realität ist −32%.
-            Die ~49pp Lücke (reduziert von 76pp ohne Amp-Decay) repräsentiert
-            exogene Faktoren (Iran-Konflikt, Makro). Timing-Struktur ist belastbar
-            (out-of-sample validiert), Preis-Amplituden sind approximativ.
+          <p className={textMuted}>
+            <span className="font-semibold">R²-Hinweis:</span>{' '}
+            Alle R² beziehen sich auf ln(Price), nicht Market Cap. R² zwischen verschiedenen
+            Baselines nicht vergleichbar (Nau/Duke). Einfaches PL als Vergleichskurve einblendbar.
           </p>
           <p className="text-amber-600 mt-2 font-semibold">
-            Kein Finanzprodukt. Modellbasierte Orientierung, keine Preisprognose.
+            Kein Finanzprodukt. Modellbasierte Orientierung, keine Anlageberatung.
             Eigene Verifikation erforderlich.
           </p>
         </div>
@@ -2073,6 +2082,7 @@ function BTCPowerLawMonitor() {
     </div>
   );
 }
+
 
     const rootEl = document.getElementById('root');
     const root = ReactDOM.createRoot(rootEl);
