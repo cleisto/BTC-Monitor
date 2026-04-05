@@ -1,0 +1,1211 @@
+// BTC Power Law Monitor v7.4 — Consolidated
+// Drei-Schichten-Modell: Decay PL + Log-Periodische Oszillation (Amp-Decay) + Makro (PMI)
+// ±1σ Prediction Bands | Peak-Fenster (±3M MAE) | Gold/BTC Rotation Signal | Live CoinGecko
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+
+
+// Genesis: April 6, 2009
+const GENESIS = new Date("2009-04-06").getTime();
+const MS_PER_DAY = 86400000;
+
+// ---------------------------------------------------------------------------
+// MODEL PARAMETERS — calibrated to scale-invariant quantile regression (w=1/t)
+//
+// Decay model: ln(P) = a + (β − d·ln(t))·ln(t)   where t = days since genesis
+//
+// Research findings:
+//   - 8 independent decay functions converge on d ≈ 0.029 at the median
+//   - Floor (Q1) has d ≈ 0 (no decay) — support accelerates
+//   - Ceiling has d > 0.029 — upper bound decays faster
+//   - Constant exponent (d=0) rejected at median: Simpson's Paradox
+//
+// Calibration targets (derived from research table):
+//   Median:  today ~$101k,  5yr ~$375k,  10yr ~$1.07M
+//   Floor:   today ~$56k,   5yr ~$209k,  10yr ~$594k   (~45% below median)
+//   Ceiling: today ~$160k,  5yr ~$597k,  10yr ~$1.69M  (~60% above median)
+// ---------------------------------------------------------------------------
+
+const MODELS = {
+  floor:   { beta: 5.10,  d: 0.000, targetToday: 56000,   label: "Floor (Q1)",        color: "#22c55e", desc: "Kein Decay, niedrigerer β" },
+  median:  { beta: 5.60,  d: 0.029, targetToday: 101000,  label: "Median Fair Value",  color: "#f59e0b", desc: "Decay d=0.029" },
+  ceiling: { beta: 5.90,  d: 0.045, targetToday: 160000,  label: "Obere Begrenzung",   color: "#ef4444", desc: "Stärkerer Decay d=0.045" },
+};
+
+// ---------------------------------------------------------------------------
+// COMPARISON: Simple Power Law (no decay, no w=1/t correction)
+// This is what most published BTC Power Law models use.
+// OLS regression of ln(price) on ln(t) — biased toward recent data.
+// Included as reference so users can see the difference.
+//   Median (OLS): ~$130k today, ~$542k 5yr, ~$1.69M 10yr
+//   Median (Linear QR): ~$118k today, ~$504k 5yr, ~$1.60M 10yr
+// ---------------------------------------------------------------------------
+
+const SIMPLE_PL = {
+  beta: 4.89,  // constant exponent (no decay)
+  d: 0.0,
+  targetToday: 118000,  // Linear Quantile Regression median (from research table)
+  label: "Einfaches PL (kein Decay)",
+  color: "#64748b",
+  desc: "Konventionell, keine Skaleninvarianz",
+};
+
+// ---------------------------------------------------------------------------
+// PREDICTION BAND: ±1σ around oscillation-adjusted median
+// σ = 0.56 in ln-space (historical residuals vs full model)
+// σ shrinks over time: 0.57 (2013–19) → 0.32 (2022–26)
+// ---------------------------------------------------------------------------
+const MODEL_SIGMA = 0.5609;  // in ln(price) space
+
+// ---------------------------------------------------------------------------
+// LOG-PERIODIC OSCILLATION (Discrete Scale Invariance)
+//
+// After removing the power law trend, the residual follows:
+//   r(t) = Σ Cₙ · cos(n·ω·ln(t) + φₙ)    (harmonics n = 1,2,3,4)
+//
+// λ ≈ 2.0 → ω = 2π/ln(λ) ≈ 9.06
+// Phase calibrated so fundamental peaks near Oct 2025 ATH ($126k)
+// R² ≈ 0.445 — explains ~45% of variance in residuals
+//
+// !  These parameters are approximate. The amplitudes and phases are
+//     estimated to reproduce known cycle peaks qualitatively.
+//     For production use, fit against actual daily price data.
+// ---------------------------------------------------------------------------
+
+const OSCILLATION = {
+  // ---------------------------------------------------------------------------
+  // FULL PRODUCTION FIT WITH AMPLITUDE DECAY
+  // 5,704 daily points (2010-07 to 2026-03)
+  // osc(t) = Σ Cₙ · t^(-δ) · cos(n·ω·ln(t) + φₙ)
+  //
+  // ω = 8.894 fixed from DSI research. δ = 0.684 found via grid search.
+  // Amplitudes + phases fitted via weighted LS (w=1/t) on Decay-PL residuals.
+  // ---------------------------------------------------------------------------
+  omega: 8.894,
+  lambda: 2.027,
+  ampDecay: 0.68357,  // δ: amplitude damping, Cₙ·t^(-δ)
+  harmonics: [
+    { n: 1, C: 118.05080, phi: 3.06676 },  // fundamental
+    { n: 2, C: 45.27629, phi: 0.04083 },   // 2ω
+    { n: 3, C: 17.11566, phi: 3.10856 },   // 3ω
+    { n: 4, C: 8.55485, phi: -0.57302 },   // 4ω
+  ],
+  rSquared: 0.605,
+  // ---------------------------------------------------------------------------
+  // AMPLITUDE DECAY INSIGHT:
+  //   R² improves 0.487 → 0.605 (+12pp). δ=0.684 means each harmonic's
+  //   effective amplitude shrinks as t^(-0.68). Concrete effect on fundamental:
+  //     2011: B_eff=0.62 dex | 2017: 0.22 | 2021: 0.17 | 2025: 0.14 | 2028: 0.12
+  //   This resolves the out-of-sample amplitude overshoot documented in the
+  //   DSI research (R²_oos = −3.50 without decay).
+  //
+  //   PRACTICAL IMPACT: Peak projection 2027-28 drops from ~$537k to ~$265k.
+  //   The timing structure (ω, phases) is unchanged — only the magnitude
+  //   of the oscillation is damped, matching the empirical observation that
+  //   each successive cycle produces smaller proportional moves.
+  //
+  // Validation: 4/6 peaks ok, 3/4 troughs ok (same as before — timing unchanged)
+  // Divergence today: 49pp (down from 76pp without amp decay)
+  // ---------------------------------------------------------------------------
+};
+
+// ---------------------------------------------------------------------------
+// ISM MANUFACTURING PMI — Business Cycle Overlay
+//
+// Regression of BTC Power Law Residual on ISM PMI (monthly):
+//   2nd half (2018–2025): R² = 0.511, p = 4.2e-12
+//   residual = β·PMI + α  →  PMI-adjusted FV = Median × exp(β·PMI + α)
+//   β ≈ 0.037, α ≈ -1.90
+// Source: ISM via FRED (Series: NAPM). Updated monthly (1st business day).
+// ---------------------------------------------------------------------------
+
+const PMI_REGRESSION = {
+  beta: 0.037,     // slope: +1 PMI point ≈ +3.7% on BTC residual
+  alpha: -1.90,    // intercept
+  rSquared: 0.511, // 2nd half (2018-2025)
+};
+
+// Historical ISM Manufacturing PMI (monthly, end-of-month values)
+// Source: ISM / FRED NAPM series. Publicly available data.
+const PMI_HISTORY = [
+  // [year_fraction, pmi_value]
+  // 2010
+  [2010.04, 57.0], [2010.12, 56.5], [2010.21, 57.8], [2010.29, 60.4], [2010.37, 59.7], [2010.46, 56.2],
+  [2010.54, 55.5], [2010.62, 56.3], [2010.71, 54.4], [2010.79, 56.9], [2010.87, 56.6], [2010.96, 57.0],
+  // 2011
+  [2011.04, 59.1], [2011.12, 60.8], [2011.21, 61.2], [2011.29, 60.6], [2011.37, 53.5], [2011.46, 55.3],
+  [2011.54, 50.9], [2011.62, 51.6], [2011.71, 51.2], [2011.79, 51.8], [2011.87, 52.7], [2011.96, 53.1],
+  // 2012
+  [2012.04, 53.5], [2012.12, 52.4], [2012.21, 53.4], [2012.29, 53.5], [2012.37, 53.5], [2012.46, 49.8],
+  [2012.54, 49.8], [2012.62, 49.6], [2012.71, 51.5], [2012.79, 51.7], [2012.87, 49.9], [2012.96, 50.7],
+  // 2013
+  [2013.04, 52.3], [2013.12, 54.2], [2013.21, 51.3], [2013.29, 50.7], [2013.37, 49.0], [2013.46, 50.9],
+  [2013.54, 55.4], [2013.62, 55.7], [2013.71, 56.2], [2013.79, 56.4], [2013.87, 57.0], [2013.96, 57.0],
+  // 2014
+  [2014.04, 51.3], [2014.12, 53.2], [2014.21, 53.7], [2014.29, 54.9], [2014.37, 55.4], [2014.46, 55.3],
+  [2014.54, 57.1], [2014.62, 57.9], [2014.71, 56.6], [2014.79, 58.7], [2014.87, 58.7], [2014.96, 55.1],
+  // 2015
+  [2015.04, 53.5], [2015.12, 52.9], [2015.21, 51.5], [2015.29, 51.5], [2015.37, 52.8], [2015.46, 53.5],
+  [2015.54, 52.7], [2015.62, 51.1], [2015.71, 50.2], [2015.79, 50.1], [2015.87, 48.6], [2015.96, 48.2],
+  // 2016
+  [2016.04, 48.2], [2016.12, 49.5], [2016.21, 51.8], [2016.29, 50.8], [2016.37, 51.3], [2016.46, 53.2],
+  [2016.54, 52.6], [2016.62, 51.5], [2016.71, 51.5], [2016.79, 51.9], [2016.87, 53.2], [2016.96, 54.7],
+  // 2017
+  [2017.04, 56.0], [2017.12, 57.7], [2017.21, 57.2], [2017.29, 54.8], [2017.37, 54.9], [2017.46, 57.8],
+  [2017.54, 56.3], [2017.62, 58.8], [2017.71, 60.8], [2017.79, 58.7], [2017.87, 58.2], [2017.96, 59.3],
+  // 2018
+  [2018.04, 59.1], [2018.12, 60.8], [2018.21, 59.3], [2018.29, 57.3], [2018.37, 58.7], [2018.46, 60.2],
+  [2018.54, 58.1], [2018.62, 61.3], [2018.71, 59.8], [2018.79, 57.7], [2018.87, 59.3], [2018.96, 54.3],
+  // 2019
+  [2019.04, 56.6], [2019.12, 54.2], [2019.21, 55.3], [2019.29, 52.8], [2019.37, 52.1], [2019.46, 51.7],
+  [2019.54, 51.2], [2019.62, 49.1], [2019.71, 47.8], [2019.79, 48.3], [2019.87, 48.1], [2019.96, 47.8],
+  // 2020
+  [2020.04, 50.9], [2020.12, 50.1], [2020.21, 49.1], [2020.29, 41.5], [2020.37, 43.1], [2020.46, 52.6],
+  [2020.54, 54.2], [2020.62, 56.0], [2020.71, 55.4], [2020.79, 59.3], [2020.87, 57.5], [2020.96, 60.7],
+  // 2021
+  [2021.04, 58.7], [2021.12, 60.8], [2021.21, 64.7], [2021.29, 60.7], [2021.37, 61.2], [2021.46, 60.6],
+  [2021.54, 59.5], [2021.62, 59.9], [2021.71, 61.1], [2021.79, 60.8], [2021.87, 61.1], [2021.96, 58.8],
+  // 2022
+  [2022.04, 57.6], [2022.12, 58.6], [2022.21, 57.1], [2022.29, 55.4], [2022.37, 56.1], [2022.46, 53.0],
+  [2022.54, 52.8], [2022.62, 52.8], [2022.71, 50.9], [2022.79, 50.2], [2022.87, 49.0], [2022.96, 48.4],
+  // 2023
+  [2023.04, 47.4], [2023.12, 47.7], [2023.21, 46.3], [2023.29, 47.1], [2023.37, 46.9], [2023.46, 46.0],
+  [2023.54, 46.4], [2023.62, 47.6], [2023.71, 49.0], [2023.79, 46.7], [2023.87, 46.7], [2023.96, 47.4],
+  // 2024
+  [2024.04, 49.2], [2024.12, 47.8], [2024.21, 50.3], [2024.29, 49.2], [2024.37, 48.7], [2024.46, 48.5],
+  [2024.54, 46.8], [2024.62, 47.2], [2024.71, 47.2], [2024.79, 46.5], [2024.87, 48.4], [2024.96, 49.3],
+  // 2025
+  [2025.04, 50.9], [2025.12, 50.3], [2025.21, 49.0], [2025.29, 48.7], [2025.37, 48.7], [2025.46, 49.7],
+  [2025.54, 48.8], [2025.62, 47.2], [2025.71, 49.6], [2025.79, 48.3], [2025.87, 48.4], [2025.96, 49.3],
+  // 2026
+  [2026.04, 50.9], [2026.12, 50.3],
+];
+
+function getPmiAdjustedFairValue(pmi, medianFV) {
+  const residualAdj = PMI_REGRESSION.beta * pmi + PMI_REGRESSION.alpha;
+  return medianFV * Math.exp(residualAdj);
+}
+
+function getLatestPmi() {
+  return PMI_HISTORY[PMI_HISTORY.length - 1];
+}
+
+function daysSinceGenesis(date = new Date()) {
+  return (date.getTime() - GENESIS) / MS_PER_DAY;
+}
+
+function powerLawPrice(t, model) {
+  const lnT = Math.log(t);
+  return Math.exp(model.a + (model.beta - model.d * lnT) * lnT);
+}
+
+function oscillationValue(t) {
+  const lnT = Math.log(t);
+  const damping = Math.pow(t, -OSCILLATION.ampDecay);  // t^(-δ): amplitude shrinks over time
+  let val = 0;
+  for (const h of OSCILLATION.harmonics) {
+    val += h.C * damping * Math.cos(h.n * OSCILLATION.omega * lnT + h.phi);
+  }
+  return val; // in ln(price) space — multiply power law by exp(val)
+}
+
+function powerLawWithOscillation(t, model) {
+  return powerLawPrice(t, model) * Math.exp(oscillationValue(t));
+}
+
+// Calibrate 'a' for each model so it hits targetToday at current date
+(function calibrateModels() {
+  const tToday = daysSinceGenesis(new Date("2026-03-23"));
+  const lnT = Math.log(tToday);
+  for (const model of Object.values(MODELS)) {
+    model.a = Math.log(model.targetToday) - (model.beta - model.d * lnT) * lnT;
+  }
+  // Also calibrate comparison model
+  SIMPLE_PL.a = Math.log(SIMPLE_PL.targetToday) - (SIMPLE_PL.beta - SIMPLE_PL.d * lnT) * lnT;
+})();
+
+// ---------------------------------------------------------------------------
+// ZONE CLASSIFICATION
+// ---------------------------------------------------------------------------
+
+function getZone(price, fairValue) {
+  const ratio = price / fairValue;
+  if (ratio < 0.55) return { zone: "DEEP_VALUE",  label: "Deep Value",              color: "#16a34a", bg: "#052e16", action: "DCA verdreifachen + Cash-Reserve deployen" };
+  if (ratio < 0.75) return { zone: "ACCUMULATE",  label: "Akkumulation",            color: "#22c55e", bg: "#14532d", action: "DCA verdoppeln" };
+  if (ratio < 0.95) return { zone: "UNDERVALUED", label: "Unterbewertet",           color: "#86efac", bg: "#1a3a2a", action: "Normales DCA + leichte Aufstockung" };
+  if (ratio < 1.15) return { zone: "FAIR",        label: "Fair Value Zone",         color: "#fbbf24", bg: "#422006", action: "Normales DCA beibehalten" };
+  if (ratio < 1.50) return { zone: "OVERVALUED",  label: "Leicht überbewertet",     color: "#f97316", bg: "#431407", action: "DCA auf 50% reduzieren" };
+  if (ratio < 2.00) return { zone: "ELEVATED",    label: "Signifikant überbewertet",color: "#ef4444", bg: "#450a0a", action: "15% Position trimmen" };
+  if (ratio < 3.00) return { zone: "EUPHORIA",    label: "Zyklusreife",             color: "#dc2626", bg: "#450a0a", action: "Weitere 15-20% trimmen" };
+  return                    { zone: "EXTREME",     label: "Euphorie-Extreme",        color: "#991b1b", bg: "#450a0a", action: "Aggressive Reduktion auf 30%" };
+}
+
+// ---------------------------------------------------------------------------
+// TAKE PROFIT LEVELS
+// ---------------------------------------------------------------------------
+
+function getTakeProfitLevels(fairValue) {
+  return [
+    { level: "Fair Value",              price: fairValue,       action: "DCA normal fortsetzen",   pct: "0%" },
+    { level: "Moderate Überbew.",       price: fairValue * 1.5, action: "DCA auf 50% reduzieren",  pct: "+50%" },
+    { level: "Signifikante Überbew.",   price: fairValue * 2.0, action: "15% trimmen",             pct: "+100%" },
+    { level: "Zyklusreife",            price: fairValue * 3.0, action: "Weitere 15-20% trimmen",  pct: "+200%" },
+    { level: "Euphorie",              price: fairValue * 4.5, action: "Aggressive Reduktion",     pct: "+350%" },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// HISTORICAL BTC PRICES (quarterly milestones for chart overlay)
+// ---------------------------------------------------------------------------
+
+const HISTORICAL_PRICES = [
+  // [year_fraction, price_usd]
+  [2013.0, 13], [2013.25, 90], [2013.5, 100], [2013.75, 200], [2013.85, 1150], [2013.95, 750],
+  [2014.0, 800], [2014.25, 450], [2014.5, 580], [2014.75, 380], [2014.95, 320],
+  [2015.0, 290], [2015.25, 240], [2015.5, 260], [2015.75, 230], [2015.95, 430],
+  [2016.0, 430], [2016.25, 420], [2016.5, 660], [2016.75, 610], [2016.95, 960],
+  [2017.0, 1000], [2017.25, 1080], [2017.4, 2500], [2017.5, 2600], [2017.6, 4400], [2017.75, 5600], [2017.85, 11000], [2017.95, 14000],
+  [2018.0, 13800], [2018.1, 8500], [2018.25, 7000], [2018.5, 6400], [2018.75, 6500], [2018.9, 4000], [2018.95, 3700],
+  [2019.0, 3700], [2019.25, 4100], [2019.4, 8000], [2019.5, 11500], [2019.6, 10000], [2019.75, 8300], [2019.95, 7200],
+  [2020.0, 7200], [2020.15, 8700], [2020.2, 5200], [2020.25, 6400], [2020.5, 9200], [2020.75, 10800], [2020.85, 13800], [2020.95, 29000],
+  [2021.0, 33000], [2021.1, 46000], [2021.2, 58000], [2021.25, 35000], [2021.35, 35000], [2021.5, 42000], [2021.65, 48000], [2021.75, 62000], [2021.85, 69000], [2021.9, 57000], [2021.95, 47000],
+  [2022.0, 38000], [2022.15, 42000], [2022.25, 31000], [2022.4, 29000], [2022.5, 20000], [2022.65, 23000], [2022.75, 20000], [2022.85, 20500], [2022.9, 17000], [2022.95, 16500],
+  [2023.0, 16700], [2023.1, 21000], [2023.2, 23000], [2023.25, 28000], [2023.35, 29000], [2023.5, 30000], [2023.65, 26000], [2023.75, 27000], [2023.85, 34000], [2023.95, 42000],
+  [2024.0, 44000], [2024.1, 52000], [2024.2, 71000], [2024.25, 64000], [2024.35, 66000], [2024.5, 58000], [2024.6, 65000], [2024.7, 56000], [2024.75, 63000], [2024.85, 73000], [2024.95, 94000],
+  [2025.0, 96000], [2025.15, 102000], [2025.25, 85000], [2025.35, 82000], [2025.5, 95000], [2025.6, 105000], [2025.75, 126000], [2025.85, 100000], [2025.95, 94000],
+  [2026.0, 93000], [2026.05, 73000], [2026.1, 72000], [2026.15, 70000], [2026.22, 68500],
+];
+
+// ---------------------------------------------------------------------------
+// FORMATTING
+// ---------------------------------------------------------------------------
+
+const fmt = (n) => {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}k`;
+  return `$${n.toFixed(0)}`;
+};
+
+const fmtPrecise = (n) => {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(3)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}k`;
+  return `$${n.toFixed(0)}`;
+};
+
+// ---------------------------------------------------------------------------
+// CHART: Power Law Bands + Historical Prices + Oscillation
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// UI COMPONENTS
+// ---------------------------------------------------------------------------
+
+function Section({ title, children, defaultOpen = false, borderColor = 'border-slate-800', id }) {
+  var _s = useState(defaultOpen); var open = _s[0]; var setOpen = _s[1];
+  return (
+    <div id={id} className={"bg-slate-900 rounded-xl border overflow-hidden " + borderColor}>
+      <button onClick={function() { setOpen(!open); }}
+        className="w-full px-4 py-3 flex items-center justify-between hover:bg-slate-800 transition-colors">
+        <h2 className="text-sm font-semibold text-slate-300">{title}</h2>
+        <span className="text-slate-500 text-xs">{open ? "^" : "v"}</span>
+      </button>
+      {open && <div className="px-4 pb-4 space-y-3">{children}</div>}
+    </div>
+  );
+}
+
+function ValueGauge({ ratio }) {
+  var pct = ((Math.max(0.3, Math.min(4.0, ratio)) - 0.3) / 3.7) * 100;
+  return (
+    <div className="relative w-full h-6 rounded-full overflow-hidden" style={{
+      background: 'linear-gradient(to right, #16a34a, #22c55e, #86efac, #fbbf24, #f97316, #ef4444, #991b1b)'
+    }}>
+      <div className="absolute top-0 h-full w-0.5 bg-white" style={{ left: pct + '%', boxShadow: '0 0 6px rgba(255,255,255,0.8)' }} />
+    </div>
+  );
+}
+
+function ZoomWrap({ children }) {
+  var _z = useState({ scale: 1, cx: 360, cy: 190 }); var zm = _z[0]; var setZm = _z[1];
+  var containerRef = useRef(null);
+  var gestRef = useRef({ dist0: 0, scale0: 1, cx0: 0, cy0: 0, midX0: 0, midY0: 0, pinching: false, panning: false, px0: 0, py0: 0 });
+  var zoomed = zm.scale > 1.05;
+
+  // Apply viewBox to all child SVGs via DOM
+  useEffect(function() {
+    if (!containerRef.current) return;
+    var svgs = containerRef.current.querySelectorAll('svg');
+    svgs.forEach(function(svg) {
+      var orig = svg.getAttribute('data-orig-vb');
+      if (!orig) { orig = svg.getAttribute('viewBox'); svg.setAttribute('data-orig-vb', orig); }
+      var parts = orig.split(' ').map(Number);
+      var ow = parts[2], oh = parts[3];
+      var nw = ow / zm.scale, nh = oh / zm.scale;
+      var nx = zm.cx - nw / 2, ny = zm.cy - nh / 2;
+      if (nx < 0) nx = 0; if (ny < 0) ny = 0;
+      if (nx + nw > ow) nx = ow - nw; if (ny + nh > oh) ny = oh - nh;
+      svg.setAttribute('viewBox', nx.toFixed(0) + ' ' + ny.toFixed(0) + ' ' + nw.toFixed(0) + ' ' + nh.toFixed(0));
+    });
+  }, [zm]);
+
+  // Reset viewBox on unmount
+  useEffect(function() {
+    return function() {
+      if (!containerRef.current) return;
+      containerRef.current.querySelectorAll('svg').forEach(function(svg) {
+        var orig = svg.getAttribute('data-orig-vb');
+        if (orig) svg.setAttribute('viewBox', orig);
+      });
+    };
+  }, []);
+
+  function getDist(e) { return Math.hypot(e.touches[1].clientX - e.touches[0].clientX, e.touches[1].clientY - e.touches[0].clientY); }
+
+  function handleTS(e) {
+    var g = gestRef.current;
+    if (e.touches.length === 2) {
+      e.stopPropagation();
+      g.pinching = true; g.panning = false;
+      g.dist0 = getDist(e); g.scale0 = zm.scale;
+      g.cx0 = zm.cx; g.cy0 = zm.cy;
+      g.midX0 = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      g.midY0 = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    } else if (e.touches.length === 1 && zm.scale > 1) {
+      g.panning = true; g.pinching = false;
+      g.px0 = e.touches[0].clientX; g.py0 = e.touches[0].clientY;
+      g.cx0 = zm.cx; g.cy0 = zm.cy;
+    }
+  }
+  function handleTM(e) {
+    var g = gestRef.current;
+    if (g.pinching && e.touches.length === 2) {
+      e.preventDefault(); e.stopPropagation();
+      var d = getDist(e);
+      var ns = Math.min(6, Math.max(1, g.scale0 * d / g.dist0));
+      var rect = containerRef.current.getBoundingClientRect();
+      var svg0 = containerRef.current.querySelector('svg');
+      var orig = svg0 ? svg0.getAttribute('data-orig-vb') : '0 0 720 380';
+      var parts = orig.split(' ').map(Number);
+      var mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      var my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      var dxSvg = (mx - g.midX0) / rect.width * (parts[2] / g.scale0);
+      var dySvg = (my - g.midY0) / rect.height * (parts[3] / g.scale0);
+      setZm({ scale: ns, cx: g.cx0 - dxSvg, cy: g.cy0 - dySvg });
+    } else if (g.panning && e.touches.length === 1 && zm.scale > 1) {
+      e.preventDefault();
+      var rect2 = containerRef.current.getBoundingClientRect();
+      var svg1 = containerRef.current.querySelector('svg');
+      var orig2 = svg1 ? svg1.getAttribute('data-orig-vb') : '0 0 720 380';
+      var p2 = orig2.split(' ').map(Number);
+      var dx = (e.touches[0].clientX - g.px0) / rect2.width * (p2[2] / zm.scale);
+      var dy = (e.touches[0].clientY - g.py0) / rect2.height * (p2[3] / zm.scale);
+      setZm({ scale: zm.scale, cx: g.cx0 - dx, cy: g.cy0 - dy });
+    }
+  }
+  function handleTE() { gestRef.current.pinching = false; gestRef.current.panning = false; }
+  function reset() { setZm({ scale: 1, cx: 360, cy: 190 }); }
+
+  return (
+    <div ref={containerRef} className="relative rounded-lg" style={{ touchAction: zoomed ? 'none' : 'pan-y' }}
+      onTouchStart={handleTS} onTouchMove={handleTM} onTouchEnd={handleTE}>
+      {children}
+      {zoomed && <button onClick={reset} className="absolute top-1 right-1 px-2 py-0.5 rounded text-xs bg-slate-800/90 text-slate-200 border border-slate-600 z-10 font-bold">1:1</button>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// POWER LAW CHART
+// ---------------------------------------------------------------------------
+
+function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
+  var tNow = daysSinceGenesis(currentDate);
+  var startYear = 2013, endYear = 2036, POINTS = 400;
+  var currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
+  var _l = useState({ hist: true, median: true, floorCeil: true, simplePL: false, oscMedian: true, sigmaBand: true, forecast: true });
+  var layers = _l[0]; var setLayers = _l[1];
+  var toggle = function(k) { setLayers(function(p) { var n = {}; for (var x in p) n[x] = p[x]; n[k] = !p[k]; return n; }); };
+
+  var _ch = useState(null); var chYear = _ch[0]; var setChYear = _ch[1];
+  var svgRef = useRef(null);
+
+  var curves = useMemo(function() {
+    var res = { floor:[], median:[], ceiling:[], oscMedian:[], oscFloor:[], oscCeiling:[], simplePL:[], sigma1Hi:[], sigma1Lo:[] };
+    for (var i = 0; i <= POINTS; i++) {
+      var frac = i / POINTS;
+      var year = startYear + (endYear - startYear) * frac;
+      var date = new Date(new Date(startYear, 0, 1).getTime() + (year - startYear) * 365.25 * MS_PER_DAY);
+      var td = daysSinceGenesis(date);
+      if (td > 100) {
+        var pt = { year: year, t: td };
+        var oscVal = oscillationValue(td);
+        var oscMul = Math.exp(oscVal);
+        var oscMedP = powerLawPrice(td, MODELS.median) * oscMul;
+        res.floor.push({ year: year, t: td, price: powerLawPrice(td, MODELS.floor) });
+        res.median.push({ year: year, t: td, price: powerLawPrice(td, MODELS.median) });
+        res.ceiling.push({ year: year, t: td, price: powerLawPrice(td, MODELS.ceiling) });
+        res.oscMedian.push({ year: year, t: td, price: oscMedP });
+        res.oscFloor.push({ year: year, t: td, price: powerLawPrice(td, MODELS.floor) * oscMul });
+        res.oscCeiling.push({ year: year, t: td, price: powerLawPrice(td, MODELS.ceiling) * oscMul });
+        res.simplePL.push({ year: year, t: td, price: powerLawPrice(td, SIMPLE_PL) });
+        res.sigma1Hi.push({ year: year, t: td, price: oscMedP * Math.exp(MODEL_SIGMA) });
+        res.sigma1Lo.push({ year: year, t: td, price: oscMedP * Math.exp(-MODEL_SIGMA) });
+      }
+    }
+    return res;
+  }, []);
+
+  var W = 720, H = 380, PAD = { top: 20, right: 55, bottom: 35, left: 62 };
+  var plotW = W - PAD.left - PAD.right, plotH = H - PAD.top - PAD.bottom;
+  var logMin = Math.log10(10), logMax = Math.log10(10000000);
+  var xScale = function(y) { return PAD.left + ((y - startYear) / (endYear - startYear)) * plotW; };
+  var yScale = function(p) { return PAD.top + plotH - ((Math.log10(Math.max(p, 10)) - logMin) / (logMax - logMin)) * plotH; };
+  var cp = function(data) { return data.filter(function(d) { return d.price > 0 && isFinite(d.price); }).map(function(d, i) { return (i === 0 ? 'M' : 'L') + xScale(d.year).toFixed(1) + ',' + yScale(d.price).toFixed(1); }).join(' '); };
+  var futOnly = function(data) { return data.filter(function(d) { return d.year >= currentYear && d.price > 0; }); };
+  var cx = xScale(currentYear), cy = yScale(currentPrice);
+  var zone = getZone(currentPrice, powerLawPrice(tNow, MODELS.median));
+  var fmtS = function(n) { return n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(0) + 'k' : n.toFixed(0); };
+
+  // Band fills
+  var flPts = curves.floor.filter(function(d) { return d.price > 0; });
+  var clPts = curves.ceiling.filter(function(d) { return d.price > 0; });
+  var bandP = flPts.map(function(d, i) { return (i===0?'M':'L') + xScale(d.year).toFixed(1) + ',' + yScale(d.price).toFixed(1); }).join(' ') + clPts.slice().reverse().map(function(d) { return 'L' + xScale(d.year).toFixed(1) + ',' + yScale(d.price).toFixed(1); }).join('') + 'Z';
+  var fF = futOnly(curves.oscFloor), fC = futOnly(curves.oscCeiling);
+  var fbP = fF.length > 2 ? fF.map(function(d,i) { return (i===0?'M':'L') + xScale(d.year).toFixed(1) + ',' + yScale(d.price).toFixed(1); }).join(' ') + fC.slice().reverse().map(function(d) { return 'L' + xScale(d.year).toFixed(1) + ',' + yScale(d.price).toFixed(1); }).join('') + 'Z' : null;
+  var histP = HISTORICAL_PRICES.filter(function(h) { return h[0] >= startYear; }).map(function(h,i) { return (i===0?'M':'L') + xScale(h[0]).toFixed(1) + ',' + yScale(h[1]).toFixed(1); }).join(' ');
+  var tEnd = daysSinceGenesis(new Date(endYear, 0, 1));
+  var labels = [
+    { price: powerLawPrice(tEnd, MODELS.ceiling), color: "#ef4444" },
+    { price: powerLawPrice(tEnd, MODELS.median), color: "#f59e0b" },
+    { price: powerLawPrice(tEnd, MODELS.floor), color: "#22c55e" },
+  ];
+
+  // Peak/trough markers
+  var markers = [];
+  if (showOscillation) {
+    var futC = curves.oscMedian.filter(function(d) { return d.year > currentYear; });
+    for (var mi = 1; mi < futC.length - 1; mi++) {
+      var oPrev = oscillationValue(futC[mi-1].t), oCurr = oscillationValue(futC[mi].t), oNext = oscillationValue(futC[mi+1].t);
+      if (oCurr > oPrev && oCurr > oNext && oCurr > 0.05) {
+        if (!markers.length || futC[mi].year - markers[markers.length-1].year > 1.5)
+          markers.push({ year: futC[mi].year, price: futC[mi].price, type: 'peak' });
+      }
+      if (oCurr < oPrev && oCurr < oNext && oCurr < -0.02) {
+        if (!markers.length || futC[mi].year - markers[markers.length-1].year > 1.5)
+          markers.push({ year: futC[mi].year, price: futC[mi].price, type: 'trough' });
+      }
+    }
+  }
+
+  function svgPointerYear(e) {
+    if (!svgRef.current) return null;
+    var rect = svgRef.current.getBoundingClientRect();
+    var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    // Read actual viewBox from DOM (may be modified by ZoomWrap)
+    var vb = svgRef.current.getAttribute('viewBox');
+    var parts = vb ? vb.split(' ').map(Number) : [0, 0, W, H];
+    var vbX = parts[0], vbW = parts[2];
+    // Convert pixel position to SVG coordinate
+    var svgX = vbX + (clientX - rect.left) / rect.width * vbW;
+    var yr = startYear + (svgX - PAD.left) / plotW * (endYear - startYear);
+    return (yr >= startYear && yr <= endYear) ? yr : null;
+  }
+  function getChData(yr) {
+    if (yr === null) return null;
+    var dt = new Date(new Date(startYear,0,1).getTime() + (yr-startYear)*365.25*MS_PER_DAY);
+    var td = daysSinceGenesis(dt);
+    var hist = null, bestD = 999;
+    for (var i = 0; i < HISTORICAL_PRICES.length; i++) {
+      var d = Math.abs(HISTORICAL_PRICES[i][0] - yr);
+      if (d < bestD) { bestD = d; hist = HISTORICAL_PRICES[i][1]; }
+    }
+    if (bestD > 0.3) hist = null;
+    var med = td > 100 ? powerLawPrice(td, MODELS.median) : null;
+    var fl = td > 100 ? powerLawPrice(td, MODELS.floor) : null;
+    var cl = td > 100 ? powerLawPrice(td, MODELS.ceiling) : null;
+    var osc = td > 100 ? powerLawPrice(td, MODELS.median) * Math.exp(oscillationValue(td)) : null;
+    var mo = Math.floor((yr % 1) * 12) + 1;
+    return { yr: yr, label: mo + '/' + Math.floor(yr), hist: hist, med: med, fl: fl, cl: cl, osc: osc };
+  }
+  var chData = chYear !== null ? getChData(chYear) : null;
+
+  return (
+    <div>
+    <svg ref={svgRef} viewBox={"0 0 " + W + " " + H} className="w-full" style={{ maxWidth: 720 }}
+      onClick={function(e) { var yr = svgPointerYear(e); setChYear(chYear !== null && Math.abs((yr||0) - chYear) < 0.5 ? null : yr); }}
+      onMouseMove={function(e) { setChYear(svgPointerYear(e)); }}
+      onMouseLeave={function() { setChYear(null); }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+      {[2014,2016,2018,2020,2022,2024,2026,2028,2030,2032,2034].map(function(y) { return (<g key={y}><line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5" /><text x={xScale(y)} y={H-8} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>); })}
+      {[100,1000,10000,100000,1000000].map(function(p) { return (<g key={p}><line x1={PAD.left} y1={yScale(p)} x2={PAD.left+plotW} y2={yScale(p)} stroke="#1e293b" strokeWidth="0.5" /><text x={PAD.left-5} y={yScale(p)+3} fill="#64748b" fontSize="8" textAnchor="end">{'$'+fmtS(p)}</text></g>); })}
+      {layers.floorCeil && <path d={bandP} fill="#1e3a2a" opacity="0.2" />}
+      {showOscillation && layers.forecast && fbP && <path d={fbP} fill="#7c3aed" opacity="0.25" />}
+      {showOscillation && layers.sigmaBand && (function() {
+        var hi = curves.sigma1Hi.filter(function(d){return d.price>0&&isFinite(d.price);}), lo = curves.sigma1Lo.filter(function(d){return d.price>0&&isFinite(d.price);});
+        if (hi.length < 2) return null;
+        var sp = lo.map(function(d,i){return (i===0?'M':'L')+xScale(d.year).toFixed(1)+','+yScale(d.price).toFixed(1);}).join(' ') + hi.slice().reverse().map(function(d){return 'L'+xScale(d.year).toFixed(1)+','+yScale(d.price).toFixed(1);}).join('') + 'Z';
+        return <path d={sp} fill="#06b6d4" opacity="0.10" />;
+      })()}
+      {layers.floorCeil && <path d={cp(curves.floor)} fill="none" stroke="#22c55e" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />}
+      {layers.floorCeil && <path d={cp(curves.ceiling)} fill="none" stroke="#ef4444" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />}
+      {layers.median && <path d={cp(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2" />}
+      {layers.simplePL && <path d={cp(curves.simplePL)} fill="none" stroke="#64748b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />}
+      {showOscillation && layers.oscMedian && <path d={cp(curves.oscMedian)} fill="none" stroke="#c084fc" strokeWidth="1.5" opacity="0.8" />}
+      {showOscillation && layers.forecast && <path d={cp(futOnly(curves.oscFloor))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />}
+      {showOscillation && layers.forecast && <path d={cp(futOnly(curves.oscCeiling))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />}
+      {layers.hist && <path d={histP} fill="none" stroke="#94a3b8" strokeWidth="1.2" opacity="0.7" />}
+      {markers.map(function(m, i) {
+        var x = xScale(m.year), y = yScale(m.price), isPk = m.type === 'peak';
+        var col = isPk ? '#22c55e' : '#ef4444';
+        var yr = Math.floor(m.year), mo = Math.floor((m.year % 1) * 12) + 1;
+        var xLo = xScale(m.year - 0.25), xHi = xScale(m.year + 0.25);
+        var lbl = isPk ? mo+'/'+yr : mo+'/'+yr;
+        var ly = isPk ? y - 26 : y + 6;
+        return (<g key={'mk'+i}>
+          <rect x={xLo} y={PAD.top} width={xHi-xLo} height={plotH} fill={col} opacity="0.06" />
+          <line x1={x} y1={PAD.top} x2={x} y2={PAD.top+plotH} stroke={col} strokeWidth="1" strokeDasharray="4,4" opacity="0.4" />
+          <circle cx={x} cy={y} r="4" fill={col} opacity="0.7" />
+          <rect x={x-30} y={ly} width="60" height="22" fill="#0f172a" opacity="0.85" rx="3" />
+          <text x={x} y={ly+10} fill={col} fontSize="7" textAnchor="middle" fontWeight="bold">{(isPk?'Peak ':'Trough ')+lbl}</text>
+          <text x={x} y={ly+19} fill={col} fontSize="7" textAnchor="middle" opacity="0.8">{'~$'+fmtS(m.price)+' (+/-3M)'}</text>
+        </g>);
+      })}
+      <line x1={cx} y1={PAD.top} x2={cx} y2={PAD.top+plotH} stroke="#f59e0b" strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+      <circle cx={cx} cy={cy} r="5" fill={zone.color} stroke="#fff" strokeWidth="1.5" />
+      {labels.map(function(d,i) { return <text key={i} x={W-PAD.right+6} y={yScale(d.price)+3} fill={d.color} fontSize="7.5" fontWeight="bold">{'$'+fmtS(d.price)}</text>; })}
+      {chData && (function() {
+        var x = xScale(chData.yr);
+        var tipX = x > W * 0.65 ? x - 130 : x + 8;
+        var rows = [];
+        if (chData.hist) rows.push({ label: 'BTC Price', val: '$' + fmtS(chData.hist), color: '#94a3b8' });
+        if (chData.med) rows.push({ label: 'Median', val: '$' + fmtS(chData.med), color: '#f59e0b' });
+        if (chData.fl) rows.push({ label: 'Floor', val: '$' + fmtS(chData.fl), color: '#22c55e' });
+        if (chData.cl) rows.push({ label: 'Ceiling', val: '$' + fmtS(chData.cl), color: '#ef4444' });
+        if (showOscillation && chData.osc) rows.push({ label: 'Osc. Med', val: '$' + fmtS(chData.osc), color: '#c084fc' });
+        return (<g>
+          <line x1={x} y1={PAD.top} x2={x} y2={PAD.top+plotH} stroke="#94a3b8" strokeWidth="0.5" strokeDasharray="2,2" />
+          <rect x={tipX} y={PAD.top+4} width={122} height={14+rows.length*12} rx={4} fill="#0f172a" opacity={0.92} stroke="#334155" strokeWidth="0.5" />
+          <text x={tipX+6} y={PAD.top+15} fill="#e2e8f0" fontSize="8" fontWeight="bold">{chData.label}</text>
+          {rows.map(function(r, ri) { return (<g key={ri}>
+            <text x={tipX+6} y={PAD.top+27+ri*12} fill={r.color} fontSize="7.5">{r.label}</text>
+            <text x={tipX+116} y={PAD.top+27+ri*12} fill={r.color} fontSize="7.5" textAnchor="end" fontFamily="monospace">{r.val}</text>
+          </g>); })}
+          {chData.hist && <circle cx={x} cy={yScale(chData.hist)} r={3} fill="#94a3b8" />}
+          {chData.med && <circle cx={x} cy={yScale(chData.med)} r={2.5} fill="#f59e0b" />}
+          {showOscillation && chData.osc && <circle cx={x} cy={yScale(chData.osc)} r={2.5} fill="#c084fc" />}
+        </g>);
+      })()}
+    </svg>
+    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 px-1">
+      {[
+        { key:'hist', color:'#94a3b8', label:'BTC Price' },
+        { key:'median', color:'#f59e0b', label:'Median (Decay)' },
+        { key:'floorCeil', color:'#22c55e', label:'Floor / Ceiling' },
+        { key:'simplePL', color:'#64748b', label:'Simple PL (ref.)' },
+      ].concat(showOscillation ? [
+        { key:'oscMedian', color:'#c084fc', label:'Osc. Median' },
+        { key:'sigmaBand', color:'#06b6d4', label:'+/-1s Band' },
+        { key:'forecast', color:'#a78bfa', label:'Forecast Band' },
+      ] : []).map(function(item) {
+        return (<button key={item.key} onClick={function(){toggle(item.key);}} className="flex items-center gap-1 text-xs py-0.5 px-1.5 rounded" style={{opacity:layers[item.key]?1:0.35}}>
+          <span style={{color:item.color}}>--</span><span style={{color:item.color}}>{item.label}</span>
+        </button>);
+      })}
+    </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// OSCILLATION CHART
+// ---------------------------------------------------------------------------
+
+function OscillationChart({ currentDate }) {
+  var tNow = daysSinceGenesis(currentDate);
+  var startYear = 2013, endYear = 2036, POINTS = 400;
+  var data = useMemo(function() {
+    var r = [];
+    for (var i = 0; i <= POINTS; i++) {
+      var year = startYear + (endYear - startYear) * i / POINTS;
+      var d = new Date(new Date(startYear,0,1).getTime() + (year-startYear)*365.25*MS_PER_DAY);
+      var td = daysSinceGenesis(d);
+      if (td > 100) r.push({ year:year, t:td, osc:oscillationValue(td) });
+    }
+    return r;
+  }, []);
+  var histR = useMemo(function() {
+    return HISTORICAL_PRICES.filter(function(h){return h[0]>=startYear&&h[0]<=endYear;}).map(function(h) {
+      var d = new Date(new Date(startYear,0,1).getTime()+(h[0]-startYear)*365.25*MS_PER_DAY);
+      var td = daysSinceGenesis(d);
+      if (td > 100) { return { year:h[0], residual:Math.log(h[1]/powerLawPrice(td,MODELS.median)) }; }
+      return null;
+    }).filter(Boolean);
+  }, []);
+  var W=720, H=200, PAD={top:15,right:25,bottom:30,left:62};
+  var plotW=W-PAD.left-PAD.right, plotH=H-PAD.top-PAD.bottom;
+  var xS=function(y){return PAD.left+((y-startYear)/(endYear-startYear))*plotW;};
+  var yS=function(v){return PAD.top+plotH/2-(v/5)*plotH;};
+  var oscP=data.map(function(d,i){return (i===0?'M':'L')+xS(d.year).toFixed(1)+','+yS(d.osc).toFixed(1);}).join(' ');
+  var curY=currentDate.getFullYear()+(currentDate.getMonth()+currentDate.getDate()/30)/12;
+  var curOsc=oscillationValue(tNow);
+  // Peak/trough markers
+  var mkrs = [];
+  var futD = data.filter(function(d){return d.year > curY;});
+  for (var mi=1; mi<futD.length-1; mi++) {
+    var p=futD[mi-1], c=futD[mi], n=futD[mi+1];
+    if (c.osc>p.osc&&c.osc>n.osc&&c.osc>0.05) { if (!mkrs.length||c.year-mkrs[mkrs.length-1].year>1.5) mkrs.push({year:c.year,osc:c.osc,type:'peak'}); }
+    if (c.osc<p.osc&&c.osc<n.osc&&c.osc<-0.02) { if (!mkrs.length||c.year-mkrs[mkrs.length-1].year>1.5) mkrs.push({year:c.year,osc:c.osc,type:'trough'}); }
+  }
+  return (
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+      {[2014,2016,2018,2020,2022,2024,2026,2028,2030,2032,2034].map(function(y){return (<g key={y}><line x1={xS(y)} y1={PAD.top} x2={xS(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5"/><text x={xS(y)} y={H-5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>);})}
+      <line x1={PAD.left} y1={yS(0)} x2={PAD.left+plotW} y2={yS(0)} stroke="#475569" strokeWidth="1"/>
+      <rect x={PAD.left} y={yS(2.5)} width={plotW} height={yS(0)-yS(2.5)} fill="#22c55e" opacity="0.06"/>
+      <rect x={PAD.left} y={yS(0)} width={plotW} height={yS(-2.5)-yS(0)} fill="#ef4444" opacity="0.06"/>
+      {histR.map(function(d,i){return <circle key={i} cx={xS(d.year)} cy={yS(d.residual)} r="2" fill={d.residual>0?"#86efac":"#fca5a5"} opacity="0.6"/>;  })}
+      <path d={oscP} fill="none" stroke="#c084fc" strokeWidth="2"/>
+      {mkrs.map(function(m,i){
+        var x=xS(m.year), isPk=m.type==='peak', col=isPk?'#22c55e':'#ef4444';
+        var yr=Math.floor(m.year), mo=Math.floor((m.year%1)*12)+1;
+        var xLo=xS(m.year-0.25), xHi=xS(m.year+0.25);
+        var ly=isPk?PAD.top+1:PAD.top+plotH-25;
+        var tM=daysSinceGenesis(new Date(yr,mo-1,1));
+        var impP=powerLawPrice(tM,MODELS.median)*Math.exp(m.osc);
+        var pL=impP>=1e6?(impP/1e6).toFixed(1)+'M':(impP/1e3).toFixed(0)+'k';
+        return (<g key={'om'+i}>
+          <rect x={xLo} y={PAD.top} width={xHi-xLo} height={plotH} fill={col} opacity="0.08"/>
+          <line x1={x} y1={PAD.top} x2={x} y2={PAD.top+plotH} stroke={col} strokeWidth="1" strokeDasharray="4,4" opacity="0.5"/>
+          <rect x={x-32} y={ly} width="64" height="24" fill="#0f172a" opacity="0.85" rx="3"/>
+          <text x={x} y={ly+10} fill={col} fontSize="7" textAnchor="middle" fontWeight="bold">{(isPk?'Peak ':'Trough ')+mo+'/'+yr}</text>
+          <text x={x} y={ly+20} fill={col} fontSize="7" textAnchor="middle" opacity="0.7">{'~$'+pL+' (+/-3M)'}</text>
+        </g>);
+      })}
+      <line x1={xS(curY)} y1={PAD.top} x2={xS(curY)} y2={PAD.top+plotH} stroke="#fbbf24" strokeWidth="1" strokeDasharray="3,3" opacity="0.7"/>
+      <circle cx={xS(curY)} cy={yS(curOsc)} r="5" fill="#c084fc" stroke="#fff" strokeWidth="1.5"/>
+      <text x={xS(curY)+8} y={yS(curOsc)-6} fill="#c084fc" fontSize="9" fontWeight="bold">{(curOsc>0?'+':'')+curOsc.toFixed(2)}</text>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PMI OVERLAY CHART
+// ---------------------------------------------------------------------------
+
+function PmiOverlayChart({ btcPrice, currentDate }) {
+  var data = useMemo(function() {
+    var r = [];
+    for (var pi = 0; pi < PMI_HISTORY.length; pi++) {
+      var yf = PMI_HISTORY[pi][0], pmi = PMI_HISTORY[pi][1], btc = null, minD = 999;
+      for (var bi = 0; bi < HISTORICAL_PRICES.length; bi++) {
+        var d = Math.abs(HISTORICAL_PRICES[bi][0] - yf);
+        if (d < minD) { minD = d; btc = HISTORICAL_PRICES[bi][1]; }
+      }
+      if (btc && minD < 0.15) r.push({ year: yf, pmi: pmi, btc: btc });
+    }
+    var cy = currentDate.getFullYear() + currentDate.getMonth() / 12;
+    r.push({ year: cy, pmi: getLatestPmi()[1], btc: btcPrice });
+    return r;
+  }, [btcPrice, currentDate]);
+  var W=720, H=220, PAD={top:20,right:50,bottom:30,left:62};
+  var plotW=W-PAD.left-PAD.right, plotH=H-PAD.top-PAD.bottom;
+  var xS=function(y){return PAD.left+((y-2013)/(2026.5-2013))*plotW;};
+  var yBtc=function(p){var l=Math.log10(Math.max(p,100)); return PAD.top+plotH-((l-2)/(5.3-2))*plotH;};
+  var yPmi=function(v){return PAD.top+plotH-((v-38)/(66-38))*plotH;};
+  var btcP=data.map(function(d,i){return (i===0?'M':'L')+xS(d.year).toFixed(1)+','+yBtc(d.btc).toFixed(1);}).join(' ');
+  var pmiSegs=[];
+  for (var si=1; si<data.length; si++) {
+    var above=(data[si-1].pmi+data[si].pmi)/2>=50;
+    pmiSegs.push({d:'M'+xS(data[si-1].year).toFixed(1)+','+yPmi(data[si-1].pmi).toFixed(1)+' L'+xS(data[si].year).toFixed(1)+','+yPmi(data[si].pmi).toFixed(1), color:above?'#22c55e':'#ef4444'});
+  }
+  return (
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+      <rect width={W} height={H} fill="#0f172a" rx="8"/>
+      {[2014,2016,2018,2020,2022,2024,2026].map(function(y){return (<g key={y}><line x1={xS(y)} y1={PAD.top} x2={xS(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5"/><text x={xS(y)} y={H-5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>);})}
+      <line x1={PAD.left} y1={yPmi(50)} x2={PAD.left+plotW} y2={yPmi(50)} stroke="#475569" strokeWidth="1" strokeDasharray="4,4"/>
+      <text x={PAD.left+plotW+4} y={yPmi(50)+3} fill="#64748b" fontSize="7">PMI 50</text>
+      {pmiSegs.map(function(s,i){return <path key={i} d={s.d} fill="none" stroke={s.color} strokeWidth="2" opacity="0.7"/>;})}
+      <path d={btcP} fill="none" stroke="#f59e0b" strokeWidth="1.5"/>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PMI ADJUSTED FAIR VALUE CHART
+// ---------------------------------------------------------------------------
+
+function PmiAdjustedFVChart({ btcPrice, currentDate }) {
+  var startYear=2018, endYear=2036, POINTS=300;
+  var curves = useMemo(function() {
+    var med=[], adj=[], latPmi=getLatestPmi()[1];
+    for (var i=0; i<=POINTS; i++) {
+      var year=startYear+(endYear-startYear)*i/POINTS;
+      var d=new Date(new Date(startYear,0,1).getTime()+(year-startYear)*365.25*MS_PER_DAY);
+      var td=daysSinceGenesis(d);
+      if (td>100) {
+        var mp=powerLawPrice(td,MODELS.median);
+        var pmi=latPmi;
+        for (var j=PMI_HISTORY.length-1;j>=0;j--) { if (PMI_HISTORY[j][0]<=year){pmi=PMI_HISTORY[j][1];break;} }
+        med.push({year:year,price:mp});
+        adj.push({year:year,price:getPmiAdjustedFairValue(pmi,mp)});
+      }
+    }
+    return {median:med,pmiAdj:adj};
+  }, []);
+  var W=720,H=220,PAD={top:20,right:55,bottom:30,left:62};
+  var plotW=W-PAD.left-PAD.right, plotH=H-PAD.top-PAD.bottom;
+  var xS=function(y){return PAD.left+((y-startYear)/(endYear-startYear))*plotW;};
+  var yS=function(p){var l=Math.log10(Math.max(p,1000)); return PAD.top+plotH-((l-3)/(6.7-3))*plotH;};
+  var cp=function(d){return d.filter(function(v){return v.price>0;}).map(function(v,i){return (i===0?'M':'L')+xS(v.year).toFixed(1)+','+yS(v.price).toFixed(1);}).join(' ');};
+  var histP=HISTORICAL_PRICES.filter(function(h){return h[0]>=startYear;}).map(function(h,i){return (i===0?'M':'L')+xS(h[0]).toFixed(1)+','+yS(h[1]).toFixed(1);}).join(' ');
+  return (
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+      <rect width={W} height={H} fill="#0f172a" rx="8"/>
+      {[2018,2020,2022,2024,2026,2028,2030,2032,2034].map(function(y){return (<g key={y}><line x1={xS(y)} y1={PAD.top} x2={xS(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5"/><text x={xS(y)} y={H-5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>);})}
+      {[1000,10000,100000,1000000].map(function(p){return (<g key={p}><line x1={PAD.left} y1={yS(p)} x2={PAD.left+plotW} y2={yS(p)} stroke="#1e293b" strokeWidth="0.5"/></g>);})}
+      <path d={histP} fill="none" stroke="#94a3b8" strokeWidth="1" opacity="0.6"/>
+      <path d={cp(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2"/>
+      <path d={cp(curves.pmiAdj)} fill="none" stroke="#06b6d4" strokeWidth="2"/>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// GOLD/BTC RATIO CHART
+// ---------------------------------------------------------------------------
+
+function GoldBtcRatioChart({ ratioHistory, currentRatio }) {
+  if (!ratioHistory.length) return <div className="text-slate-500 text-sm text-center py-6">Loading ratio data...</div>;
+  var W=720, H=200, PAD={top:20,right:55,bottom:30,left:62};
+  var plotW=W-PAD.left-PAD.right, plotH=H-PAD.top-PAD.bottom;
+  var tsMin=ratioHistory[0].ts, tsMax=ratioHistory[ratioHistory.length-1].ts;
+  var ratios=ratioHistory.map(function(d){return d.ratio;});
+  var rMin=Math.min.apply(null,ratios)*0.9, rMax=Math.max.apply(null,ratios)*1.1;
+  var xS=function(ts){return PAD.left+((ts-tsMin)/(tsMax-tsMin))*plotW;};
+  var yS=function(r){return PAD.top+plotH-((r-rMin)/(rMax-rMin))*plotH;};
+  var path=ratioHistory.map(function(d,i){return (i===0?'M':'L')+xS(d.ts).toFixed(1)+','+yS(d.ratio).toFixed(1);}).join(' ');
+  // 14d MA
+  var maData=[];
+  for (var mi=14; mi<ratioHistory.length; mi++) {
+    var sum=0; for (var j=mi-14;j<mi;j++) sum+=ratioHistory[j].ratio;
+    maData.push({ts:ratioHistory[mi].ts,ratio:sum/14});
+  }
+  var maPath=maData.map(function(d,i){return (i===0?'M':'L')+xS(d.ts).toFixed(1)+','+yS(d.ratio).toFixed(1);}).join(' ');
+  return (
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+      <rect width={W} height={H} fill="#0f172a" rx="8"/>
+      <path d={path} fill="none" stroke="#fbbf24" strokeWidth="1.2" opacity="0.5"/>
+      {maPath && <path d={maPath} fill="none" stroke="#fbbf24" strokeWidth="2"/>}
+      <circle cx={PAD.left+plotW} cy={Math.max(PAD.top,Math.min(PAD.top+plotH,yS(currentRatio)))} r="4" fill="#fbbf24" stroke="#fff" strokeWidth="1.5"/>
+      <text x={W-PAD.right+6} y={Math.max(PAD.top+10,Math.min(PAD.top+plotH,yS(currentRatio)))+3} fill="#fbbf24" fontSize="8" fontWeight="bold">{currentRatio.toFixed(3)}</text>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MAIN DASHBOARD
+// ---------------------------------------------------------------------------
+
+export default function BTCPowerLawMonitor() {
+  var _bp = useState(68500); var btcPrice = _bp[0]; var setBtcPrice = _bp[1];
+  var _gp = useState(3050); var goldPrice = _gp[0]; var setGoldPrice = _gp[1];
+  var _cd = useState(function(){return new Date().toISOString().split('T')[0];}); var customDate = _cd[0]; var setCustomDate = _cd[1];
+  var _so = useState(true); var showOscillation = _so[0]; var setShowOscillation = _so[1];
+  var _ar = useState(true); var autoRefresh = _ar[0]; var setAutoRefresh = _ar[1];
+  var _lu = useState(null); var lastUpdate = _lu[0]; var setLastUpdate = _lu[1];
+  var _fs = useState('idle'); var fetchStatus = _fs[0]; var setFetchStatus = _fs[1];
+  var _rh = useState([]); var ratioHistory = _rh[0]; var setRatioHistory = _rh[1];
+  var _th = useState('dark'); var theme = _th[0]; var setTheme = _th[1];
+  var _pg = useState('dashboard'); var page = _pg[0]; var setPage = _pg[1];
+  var _nv = useState(false); var navOpen = _nv[0]; var setNavOpen = _nv[1];
+
+  var isDark = theme === 'dark';
+
+  var fetchPrice = useCallback(function() {
+    setFetchStatus('loading');
+    fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tether-gold&vs_currencies=usd')
+      .then(function(r){return r.json();})
+      .then(function(data) {
+        if (data && data.bitcoin && data.bitcoin.usd) {
+          setBtcPrice(Math.round(data.bitcoin.usd));
+          setCustomDate(new Date().toISOString().split('T')[0]);
+          setLastUpdate(new Date());
+          setFetchStatus('ok');
+        }
+        if (data && data['tether-gold'] && data['tether-gold'].usd) setGoldPrice(Math.round(data['tether-gold'].usd));
+      })
+      .catch(function(){setFetchStatus('error');});
+  }, []);
+
+  useEffect(function(){fetchPrice();}, [fetchPrice]);
+  useEffect(function(){
+    if (!autoRefresh) return;
+    var iv = setInterval(fetchPrice, 60000);
+    return function(){clearInterval(iv);};
+  }, [autoRefresh, fetchPrice]);
+
+  // Gold/BTC ratio history
+  useEffect(function() {
+    var cancelled = false;
+    function go() {
+      setTimeout(function() {
+        fetch('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=90')
+          .then(function(r){return r.json();})
+          .then(function(btcData) {
+            if (cancelled || !btcData || !btcData.prices) return;
+            setTimeout(function() {
+              fetch('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=xau&days=90')
+                .then(function(r){return r.json();})
+                .then(function(xauData) {
+                  if (cancelled) return;
+                  if (xauData && xauData.prices && xauData.prices.length > 0) {
+                    var hist = xauData.prices.map(function(p){return {ts:p[0],ratio:1/p[1],btc:0,gold:0};}).filter(function(d){return d.ratio>0&&isFinite(d.ratio);});
+                    if (hist.length > 0) setRatioHistory(hist);
+                  }
+                }).catch(function(){});
+            }, 2000);
+          }).catch(function(){});
+      }, 4000);
+    }
+    go();
+    return function(){cancelled=true;};
+  }, []);
+
+  var currentDate = new Date(customDate);
+  var tNow = daysSinceGenesis(currentDate);
+  var fairValue = powerLawPrice(tNow, MODELS.median);
+  var floorValue = powerLawPrice(tNow, MODELS.floor);
+  var ceilingValue = powerLawPrice(tNow, MODELS.ceiling);
+  var oscAdjustedFV = powerLawWithOscillation(tNow, MODELS.median);
+  var ratio = btcPrice / fairValue;
+  var zone = getZone(btcPrice, fairValue);
+  var takeProfits = getTakeProfitLevels(fairValue);
+  var latestPmi = getLatestPmi()[1];
+
+  var projections = [
+    {label:'6 months',days:182},{label:'1 year',days:365},{label:'2 years',days:730},
+    {label:'5 years',days:1825},{label:'10 years',days:3650},
+  ].map(function(p){
+    var tF=tNow+p.days;
+    return {label:p.label,floor:powerLawPrice(tF,MODELS.floor),median:powerLawPrice(tF,MODELS.median),ceiling:powerLawPrice(tF,MODELS.ceiling),oscMedian:powerLawWithOscillation(tF,MODELS.median)};
+  });
+
+  var scrollTo = function(id) { var el=document.getElementById(id); if(el) el.scrollIntoView({behavior:'smooth',block:'start'}); setNavOpen(false); };
+  var navSections = [
+    {id:'sec-zone',label:'Zone & DCA'},{id:'sec-values',label:'Fair Values'},{id:'sec-proj',label:'Projections'},
+    {id:'sec-cycle',label:'Cycle Position'},{id:'sec-timing',label:'Cycle Timing'},{id:'sec-chart',label:'PL Bands'},
+    {id:'sec-pmi',label:'PMI'},{id:'sec-gold',label:'Gold/BTC'},{id:'sec-rotation',label:'Rotation'},{id:'sec-tp',label:'Take-Profit'},
+  ];
+
+  // Rotation regime
+  var regime = null, regimeDiff = 0;
+  if (ratioHistory.length >= 10) {
+    var rCurr = ratioHistory[ratioHistory.length-1], rPrev = ratioHistory[Math.max(0,ratioHistory.length-8)];
+    var ratioChg = (rCurr.ratio / rPrev.ratio - 1) * 100;
+    var btcR = -ratioChg/2, goldR = ratioChg/2;
+    regimeDiff = btcR - goldR;
+    if (regimeDiff >= 0 && Math.abs(btcR) >= Math.abs(goldR)) regime = 'risk_on';
+    else if (regimeDiff >= 0) regime = 'rotation';
+    else if (Math.abs(btcR) >= Math.abs(goldR)) regime = 'risk_off';
+    else regime = 'safe_haven';
+  }
+  var regimeInfo = {
+    risk_on: {color:'#f97316',label:'Risk-On',desc:'BTC outperforms gold - risk appetite rising',icon:'>>'},
+    rotation: {color:'#22c55e',label:'Rotation to BTC',desc:'Gold dropping, BTC holds - capital leaving safe haven',icon:'<>'},
+    risk_off: {color:'#ef4444',label:'Risk-Off',desc:'BTC drops harder than gold - flight from risk',icon:'vv'},
+    safe_haven: {color:'#eab308',label:'Safe Haven',desc:'Gold outperforms - flight to safety',icon:'^^'},
+  };
+
+  // Cycle timing - find next peak
+  var peakYear = null, peakOsc = 0;
+  var curYr = currentDate.getFullYear() + currentDate.getMonth() / 12;
+  for (var si = 1; si < 5000; si++) {
+    var sy = curYr + si * 0.005;
+    var sd = new Date(new Date(2013,0,1).getTime() + (sy-2013)*365.25*MS_PER_DAY);
+    var st = daysSinceGenesis(sd);
+    if (st < 100) continue;
+    var so = oscillationValue(st), sop = oscillationValue(st-10), son = oscillationValue(st+10);
+    if (so > sop && so > son && so > 0.05 && !peakYear) { peakYear = sy; peakOsc = so; break; }
+  }
+  var peakMo = peakYear ? Math.floor((peakYear%1)*12)+1 : 0;
+  var peakYr = peakYear ? Math.floor(peakYear) : 0;
+  var monthsAway = peakYear ? Math.round((peakYear - curYr) * 12) : 0;
+
+  // PMI conditions
+  var pmi12m = PMI_HISTORY.slice(-12).map(function(d){return d[1];});
+  var pmiMax12 = pmi12m.length > 0 ? Math.max.apply(null, pmi12m) : latestPmi;
+  var pmiRollover = pmiMax12 >= 57 && latestPmi < pmiMax12 - 1;
+  var conditions = [
+    {label:'Cycle Model',met:monthsAway<30&&monthsAway>0,detail:'~'+monthsAway+' months (+/-3M MAE)'},
+    {label:'PMI >= 55',met:latestPmi>=55,detail:'Current: '+latestPmi.toFixed(1)},
+    {label:'PMI 12M high >= 57',met:pmiMax12>=57,detail:'12M high: '+pmiMax12.toFixed(1)},
+    {label:'PMI Rollover',met:pmiRollover,detail:pmiMax12.toFixed(1)+' -> '+latestPmi.toFixed(1)},
+    {label:'Gold/BTC falling',met:ratioHistory.length>10&&ratioHistory[ratioHistory.length-1].ratio<ratioHistory[Math.max(0,ratioHistory.length-15)].ratio,detail:goldPrice>0?'Gold/BTC: '+(goldPrice/btcPrice).toFixed(4):'No data'},
+    {label:'Price > Median',met:btcPrice>fairValue,detail:Math.round(btcPrice/fairValue*100)+'% of median'},
+  ];
+  var metCount = conditions.filter(function(c){return c.met;}).length;
+  var readinessLabel = metCount >= 5 ? 'Peak close' : metCount >= 4 ? 'Build-up' : metCount >= 2 ? 'Early cycle' : 'Accumulation';
+
+  var bg = isDark ? 'bg-slate-950' : 'bg-gray-50';
+  var cardBg = isDark ? 'bg-slate-900' : 'bg-white';
+  var cardBdr = isDark ? 'border-slate-800' : 'border-gray-200';
+  var txt2 = isDark ? 'text-slate-400' : 'text-gray-500';
+  var txt3 = isDark ? 'text-slate-600' : 'text-gray-400';
+  var inputCls = isDark ? 'bg-slate-800 border-slate-700 text-white' : 'bg-gray-50 border-gray-300 text-gray-900';
+
+  return (
+    <div className={"min-h-screen p-4 " + bg + (isDark ? " text-white" : " text-gray-900")} style={{fontFamily:'system-ui, -apple-system, sans-serif'}}>
+      <div className="max-w-3xl mx-auto space-y-4">
+
+        <div className="text-center space-y-2">
+          <div className="flex items-center justify-center gap-2">
+            <h1 className="text-2xl font-bold text-amber-400">BTC Power Law Monitor</h1>
+            <button onClick={function(){setTheme(isDark?'light':'dark');}} className={"px-2 py-1 rounded-lg text-xs " + (isDark?'bg-slate-800 text-slate-400':'bg-gray-200 text-gray-600')}>{isDark ? 'Light' : 'Dark'}</button>
+          </div>
+          <div className="flex items-center justify-center gap-1">
+            {['dashboard','btcpedia'].map(function(tab) {
+              return <button key={tab} onClick={function(){setPage(tab);}} className={"px-4 py-1.5 rounded-lg text-sm font-medium " + (page===tab ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' : txt2)}>{tab === 'dashboard' ? 'Dashboard' : 'BTCpedia'}</button>;
+            })}
+          </div>
+          {page === 'dashboard' && <div className="relative inline-block">
+            <button onClick={function(){setNavOpen(!navOpen);}} className={"text-xs px-3 py-1 rounded-lg " + (isDark?'bg-slate-800 text-slate-400 border border-slate-700':'bg-gray-100 text-gray-500 border border-gray-200')}>Jump to section v</button>
+            {navOpen && <div className={"absolute left-1/2 mt-1 border rounded-lg shadow-lg z-50 py-1 min-w-48 " + (isDark?'bg-slate-800 border-slate-700':'bg-white border-gray-200')} style={{transform:'translateX(-50%)'}}>
+              {navSections.map(function(s){return <button key={s.id} onClick={function(){scrollTo(s.id);}} className={"block w-full text-left px-3 py-1.5 text-xs " + (isDark?'text-slate-300 hover:bg-slate-700':'text-gray-700 hover:bg-gray-50')}>{s.label}</button>;})}
+            </div>}
+          </div>}
+        </div>
+
+        {page === 'dashboard' && <div className="space-y-4">
+
+          <div className={cardBg + " rounded-xl p-4 border " + cardBdr}>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className={"text-xs uppercase " + txt2}>BTC Price (USD) {fetchStatus==='ok' && <span className="text-green-400">Live</span>}{fetchStatus==='error' && <span className="text-red-400">Offline</span>}</label>
+                <input type="number" value={btcPrice} onChange={function(e){setBtcPrice(Number(e.target.value));setAutoRefresh(false);}} className={"w-full mt-1 border rounded-lg px-3 py-2 text-lg font-mono " + inputCls} />
+              </div>
+              <div>
+                <label className={"text-xs uppercase " + txt2}>Date</label>
+                <input type="date" value={customDate} onChange={function(e){setCustomDate(e.target.value);setAutoRefresh(false);}} className={"w-full mt-1 border rounded-lg px-3 py-2 text-lg " + inputCls} />
+              </div>
+            </div>
+            <div className="mt-3 flex items-center gap-2 flex-wrap">
+              <button onClick={function(){setShowOscillation(!showOscillation);}} className="px-3 py-1 rounded-lg text-xs font-medium bg-purple-900/50 text-purple-300 border border-purple-700">Log-Periodic {showOscillation ? 'ON' : 'OFF'}</button>
+              <button onClick={function(){setAutoRefresh(!autoRefresh);if(!autoRefresh)fetchPrice();}} className="px-3 py-1 rounded-lg text-xs font-medium bg-green-900/50 text-green-300 border border-green-700">Auto-Refresh {autoRefresh ? 'ON (60s)' : 'OFF'}</button>
+              <button onClick={fetchPrice} className="px-3 py-1 rounded-lg text-xs font-medium bg-slate-800 text-slate-400 border border-slate-700">Refresh now</button>
+              {lastUpdate && <span className={"text-xs " + txt3}>Updated: {lastUpdate.toLocaleTimeString()}</span>}
+            </div>
+          </div>
+
+          <div id="sec-zone" className={cardBg + " rounded-xl p-4 border " + cardBdr + " space-y-3"}>
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-xl font-bold" style={{color:zone.color}}>{zone.label}</span>
+                <p className={txt2 + " text-sm mt-1"}>Price / Fair Value: <span className="text-white font-mono">{(ratio*100).toFixed(1)}%</span></p>
+              </div>
+              <div className="text-right">
+                <p className={"text-xs " + txt3}>ACTION</p>
+                <p className="text-sm font-medium" style={{color:zone.color}}>{zone.action}</p>
+              </div>
+            </div>
+            <ValueGauge ratio={ratio} />
+            <div className="flex items-center gap-3 mt-2 pt-2" style={{borderTop:'1px solid rgba(100,116,139,0.2)'}}>
+              <div className="text-center">
+                <div className="text-2xl font-bold font-mono" style={{color:zone.color}}>
+                  {ratio<0.55?'3.0x':ratio<0.75?'2.0x':ratio<0.95?'1.5x':ratio<1.15?'1.0x':ratio<1.5?'0.5x':'0.25x'}
+                </div>
+                <p className={"text-xs "+txt3}>DCA Multiplier</p>
+              </div>
+              <div className={"flex-1 text-xs grid grid-cols-3 gap-x-2 gap-y-0.5 "+txt3}>
+                <span className="text-green-500">&lt;55%: 3x</span><span className="text-green-400">55-75%: 2x</span><span className="text-lime-300">75-95%: 1.5x</span>
+                <span className="text-amber-400">95-115%: 1x</span><span className="text-orange-400">115-150%: 0.5x</span><span className="text-red-400">150%+: 0.25x</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="sec-values" className="grid grid-cols-4 gap-2">
+            {[{l:'Floor',v:floorValue,c:'green'},{l:'Median',v:fairValue,c:'amber'},{l:'Osc. Med',v:oscAdjustedFV,c:'purple',osc:true},{l:'Ceiling',v:ceilingValue,c:'red'}].map(function(item) {
+              if (item.osc && !showOscillation) return null;
+              return <div key={item.l} className={cardBg+" rounded-xl p-3 border "+cardBdr+" text-center"}>
+                <p className={"text-xs uppercase text-"+item.c+"-400"}>{item.l}</p>
+                <p className={"text-base font-bold font-mono text-"+item.c+"-300"}>{fmt(item.v)}</p>
+              </div>;
+            })}
+          </div>
+
+          <div id="sec-proj" className={cardBg+" rounded-xl p-4 border "+cardBdr}>
+            <h2 className={"text-sm font-semibold mb-2 "+(isDark?'text-slate-300':'text-gray-700')}>Fair Value Projections</h2>
+            <table className="w-full text-sm"><thead><tr className={"text-xs uppercase "+txt3}><th className="text-left py-1 px-2">Horizon</th><th className="text-right py-1 px-2">Floor</th><th className="text-right py-1 px-2">Median</th><th className="text-right py-1 px-2">Ceiling</th></tr></thead>
+            <tbody>{projections.map(function(p,i){return <tr key={i} className={i%2===0?(isDark?'bg-slate-800/30':'bg-gray-50'):''}><td className="py-1 px-2">{p.label}</td><td className="py-1 px-2 text-right font-mono text-green-400 text-xs">{fmt(p.floor)}</td><td className="py-1 px-2 text-right font-mono text-amber-400 text-xs font-semibold">{fmt(p.median)}</td><td className="py-1 px-2 text-right font-mono text-red-400 text-xs">{fmt(p.ceiling)}</td></tr>;})}</tbody></table>
+          </div>
+
+          {showOscillation && <Section id="sec-cycle" title="Cycle Position" borderColor="border-purple-900/30">
+            <OscillationChart currentDate={currentDate} />
+            <p className={"text-xs text-center "+txt3}>Dots = historical residuals | Line = log-periodic model</p>
+          </Section>}
+
+          {showOscillation && peakYear && <Section id="sec-timing" title={"Cycle Timing - " + metCount + "/6 - " + readinessLabel} borderColor="border-purple-900/30">
+            <div className={(isDark?'bg-slate-800/60':'bg-gray-50')+" rounded-lg p-3 flex items-center justify-between"}>
+              <div>
+                <p className={"text-xs uppercase "+txt3}>Next Peak Window</p>
+                <p className="text-lg font-bold text-green-400">{(peakMo-3>0?peakMo-3:peakMo-3+12)+'/'+(peakMo-3>0?peakYr:peakYr-1)} - {(peakMo+3>12?peakMo+3-12:peakMo+3)+'/'+(peakMo+3>12?peakYr+1:peakYr)}</p>
+                <p className={"text-xs "+txt3}>Center: {peakMo}/{peakYr} | ~{monthsAway} months | MAE +/-3M</p>
+              </div>
+              <div className="text-right">
+                <p className={"text-xs "+txt3}>Implied Peak Price</p>
+                <p className="text-lg font-bold font-mono text-green-300">{fmt(powerLawPrice(daysSinceGenesis(new Date(peakYr,peakMo-1,1)),MODELS.median)*Math.exp(peakOsc))}</p>
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              {conditions.map(function(c,i){return <div key={i} className={"flex items-center justify-between px-3 py-2 rounded-lg text-sm "+(c.met?(isDark?'bg-slate-800/80':'bg-gray-100'):(isDark?'bg-slate-800/30':'bg-gray-50/50'))}>
+                <div className="flex items-center gap-2">
+                  <div className={"w-3 h-3 rounded-full "+(c.met?'bg-green-500':'border border-slate-600')} />
+                  <span className={c.met?'text-slate-200':'text-slate-500'}>{c.label}</span>
+                </div>
+                <span className={"text-xs font-mono "+txt3}>{c.detail}</span>
+              </div>;})}
+            </div>
+          </Section>}
+
+          <Section id="sec-chart" title="Power Law Bands (log scale)">
+            <ZoomWrap><PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} /></ZoomWrap>
+          </Section>
+
+          <Section id="sec-pmi" title="Business Cycle - ISM PMI" borderColor="border-cyan-900/30">
+            <div className={"flex items-center gap-3 text-xs mb-2 "+txt2}>
+              <span>PMI: <span className="font-mono font-bold" style={{color:latestPmi>=50?'#22c55e':'#ef4444'}}>{latestPmi.toFixed(1)}</span></span>
+              <span style={{color:latestPmi>=50?'#22c55e':'#ef4444'}}>{latestPmi>=50?'Expansion':'Contraction'}</span>
+              <span>PMI-adj FV: <span className="text-cyan-400 font-mono">{'$'+fmt(getPmiAdjustedFairValue(latestPmi,fairValue))}</span></span>
+            </div>
+            <ZoomWrap>
+              <PmiOverlayChart btcPrice={btcPrice} currentDate={currentDate} />
+              <PmiAdjustedFVChart btcPrice={btcPrice} currentDate={currentDate} />
+            </ZoomWrap>
+            <p className={"text-xs "+txt3}>Orange = BTC price (log) | Green/Red = PMI (above/below 50) | Cyan = PMI-adjusted fair value</p>
+          </Section>
+
+          <Section id="sec-gold" title="Gold / BTC Ratio (90 days)" borderColor="border-amber-900/30">
+            <div className={"flex items-center gap-3 text-xs mb-2 "+txt2}>
+              <span>Gold: <span className="text-amber-400 font-mono">{'$'+goldPrice.toLocaleString()}</span></span>
+              <span>BTC: <span className="font-mono">{'$'+btcPrice.toLocaleString()}</span></span>
+              <span>1 oz = <span className="text-amber-300 font-mono">{(goldPrice/btcPrice).toFixed(4)}</span> BTC</span>
+            </div>
+            <ZoomWrap><GoldBtcRatioChart ratioHistory={ratioHistory} currentRatio={goldPrice/btcPrice} /></ZoomWrap>
+            <p className={"text-xs "+txt3}>Falling ratio = BTC gains vs gold (bull). Rising = gold beats BTC (correction/safe haven).</p>
+          </Section>
+
+          <Section id="sec-rotation" title="Macro Regime: Gold / BTC Rotation" borderColor="border-emerald-900/30">
+            <div className="grid grid-cols-4 gap-2">
+              {['risk_on','rotation','risk_off','safe_haven'].map(function(key) {
+                var info = regimeInfo[key], active = regime === key;
+                return <div key={key} className={"rounded-lg p-2.5 text-center " + (active ? (isDark?'bg-slate-800 ring-2':'bg-gray-50 ring-2') : 'opacity-40 ' + (isDark?'bg-slate-800/30':'bg-gray-50/50'))} style={active?{boxShadow:'0 0 12px '+info.color+'30'}:{}}>
+                  <div className="text-lg mb-0.5" style={{color:active?info.color:'#475569'}}>{info.icon}</div>
+                  <p className="text-xs font-bold" style={{color:active?info.color:'#475569'}}>{info.label}</p>
+                  {active && <p className={"text-xs mt-1 "+txt3}>{(regimeDiff>=0?'+':'')+regimeDiff.toFixed(1)+'%'}</p>}
+                </div>;
+              })}
+            </div>
+            {regime && <p className={"text-xs mt-2 text-center "+txt3}>{regimeInfo[regime].desc}</p>}
+          </Section>
+
+          <Section id="sec-tp" title="Take-Profit Trigger">
+            <div className="space-y-1.5">
+              {takeProfits.map(function(tp,i) {
+                var isAct = btcPrice >= tp.price;
+                return <div key={i} className={"flex items-center justify-between px-3 py-2 rounded-lg text-sm "+(isAct?'bg-red-900/30 border border-red-800/50':(isDark?'bg-slate-800/50':'bg-gray-50'))}>
+                  <div className="flex items-center gap-2">
+                    <div className={"w-2 h-2 rounded-full "+(isAct?'bg-red-400':'bg-slate-600')} />
+                    <span className={isAct?'text-red-300':txt2}>{tp.level}</span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="font-mono">{fmt(tp.price)}</span>
+                    <span className={"text-xs w-12 text-right "+txt3}>{tp.pct}</span>
+                  </div>
+                </div>;
+              })}
+            </div>
+          </Section>
+
+          <div className={(isDark?'bg-slate-800/50':'bg-gray-100')+" rounded-xl p-4 text-xs "+txt3+" space-y-2"}>
+            <p className={"font-semibold "+txt2}>Three-Layer Model + Macro Overlay</p>
+            <p><span className="text-amber-500 font-semibold">Layer 1 - Trend:</span> Decay Power Law d=0.029. $101k median, $56k floor, $160k ceiling.</p>
+            <p><span className="text-purple-500 font-semibold">Layer 2 - Oscillation:</span> Log-periodic with amp decay. w=8.894, lambda=2.03, delta=0.684. R2=0.605. +/-1sigma band.</p>
+            <p><span className="text-cyan-500 font-semibold">Layer 3 - Macro:</span> ISM PMI regression R2=0.51. Peak condition: PMI &gt;= 55. C = K*ln(lambda) = 3.96.</p>
+            <p className="text-amber-600 mt-2 font-semibold">Not a financial product. Model-based orientation, not investment advice.</p>
+          </div>
+
+        </div>}
+
+        {page === 'btcpedia' && <div className="space-y-4">
+          <p className={"text-sm text-center "+txt2}>Background knowledge - scientifically grounded, clearly explained.</p>
+
+          <Section title="Why Genesis? (t0 = Jan 3, 2009)" defaultOpen={true}>
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>Optimizing t0 as a free parameter improves R2 from 0.9613 to 0.9628 - a gain of just 0.15%, well within bootstrap confidence bands. But the exponent drifts from 5.69 to 5.09, 13.8% away from the independent SSA benchmark (5.9).</p>
+              <p><strong>Three independent methods converge:</strong> SSA eigenmode: 5.9 | Standard regression: 5.69 at t0=Genesis | Nonlinear optimization: 5.69 at t0=0 | Our decay model: 5.60 (lower due to d=0.029).</p>
+              <p>Occam's Razor: any origin within +/-200 days of Genesis produces identical fits. The simplest model wins.</p>
+            </div>
+          </Section>
+
+          <Section title="Why the 4-year cycle is wrong">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>The scaling factor lambda = 2.03 means each cycle is roughly double the previous - not that all are 4 years. The sequence (~2, ~4, ~4, ~7 years) looks like "4 years" by coincidence.</p>
+              <p>Confirmed by 5 independent tests: Fourier, Wavelet, Peak timing, Trough timing, Lomb-Scargle. Plus Hurst R/S and DFA (Perrenod 2026).</p>
+              <p><strong>Consequence:</strong> Those expecting a 2025 peak (4 years after 2021) were wrong. Peak window: H2 2027 - H1 2028 (+/-3 months MAE).</p>
+            </div>
+          </Section>
+
+          <Section title="Why Decay? (d = 0.029)">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>8 independent decay functions converge on d = 0.029 at the median. The optimizer freely rejected d = 0. Jacobian correction w(t) = 1/t ensures true scale invariance.</p>
+              <p><strong>Practical effect:</strong> Simple PL projects $118k today, our decay model $101k - a ~17% difference that grows over time. At 5 years: $542k vs $375k. Decay is more conservative and more honest.</p>
+            </div>
+          </Section>
+
+          <Section title="The Hidden Coupling Constant (C = 3.96)">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>C = K * ln(lambda) = 5.60 * ln(2.027) = 3.96. Growth rate and cycle structure emerge from the same mathematical mechanism - they are not independent.</p>
+              <p>exp(C) = 52. Each completed cycle raises the structural floor by ~52x. Two independent models converge on C = 3.96-3.97.</p>
+            </div>
+          </Section>
+
+          <Section title="Why R2 is often misleading">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>Many BTC models advertise R2 &gt; 0.95. This is often misleading. Market Cap = Price x Supply, and Supply is a smooth deterministic function. The power law absorbs this trivially, inflating R2 to ~0.97.</p>
+              <p>Our R2 values refer to ln(Price) - the more honest basis. R2 between different baselines is not comparable (different residuals = different y-variables).</p>
+            </div>
+          </Section>
+
+          <Section title="Gold to BTC: The Lead Effect">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>Gold bull runs precede BTC bull runs. The lag shrinks: 428 days (2011-2013), 243 days (2016-2017), 63 days (2020-2021). Consistent with increasing institutionalization.</p>
+              <p><strong>Limitation:</strong> Three data points. Post-hoc marked phases. Useful as qualitative context, not a standalone forecast model.</p>
+            </div>
+          </Section>
+
+          <Section title="ISM PMI: Why the business cycle moves BTC">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>The BTC-PMI relationship is strengthening: R2 = 0.18 (2010-2018) to R2 = 0.51 (2018-2025). All four historical BTC peaks occurred with PMI 55-61 (avg 58). At 3/4 peaks, PMI was declining from a high.</p>
+              <p>Peak conditions: PMI at peak 55-61 | PMI 12M high &gt;= 57 | PMI rollover (high but declining, 3/4 cycles).</p>
+            </div>
+          </Section>
+
+          <Section title="Three independent models - one result">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>Multiple research groups converge: Beta 5.60-5.69, omega 8.89-9.01, lambda 2.01-2.03, C = 3.96-3.97, Peak ~2028.</p>
+              <p>The elegant formulation: P = A * Re(t^(beta + i*omega)). Real part = trend, imaginary = oscillation. Same mechanism.</p>
+              <p><strong>Our differentiator:</strong> Exponent decay (d=0.029) + amplitude decay (delta=0.684) = more conservative projections (~$265k vs ~$400k+ for 2028 peak).</p>
+            </div>
+          </Section>
+
+          <Section title="Amplitude Decay: Why cycles are shrinking">
+            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+              <p>Historical amplitudes: 2011: 0.62 dex (4.2x over trend) | 2013: 0.40 dex (2.5x) | 2017: 0.22 dex (1.7x) | 2021: 0.16 dex (1.4x). Projection 2028: 0.12 dex (1.3x).</p>
+              <p>Bitcoin is becoming more efficient: institutional participants, ETFs since 2024, deeper liquidity. Models without amplitude decay project $400-500k for 2028. Ours says ~$265k.</p>
+            </div>
+          </Section>
+
+        </div>}
+
+      </div>
+    </div>
+  );
+}
