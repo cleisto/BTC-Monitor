@@ -18,7 +18,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const { useState, useMemo, useEffect, useCallback } = React;
+    const { useState, useMemo, useEffect, useCallback, useRef } = React;
 
 // Drei-Schichten-Modell: Decay PL + Log-Periodische Oszillation (Amp-Decay) + Makro (PMI)
 // ±1σ Prediction Bands | Peak-Fenster (±3M MAE) | Gold/BTC Rotation Signal | Live CoinGecko
@@ -439,7 +439,7 @@ function ZoomWrap({ children }) {
 
 function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
   var tNow = daysSinceGenesis(currentDate);
-  var startYear = 2013, endYear = 2036, POINTS = 400;
+  var startYear = 2013, endYear = 2036, POINTS = 150;
   var currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
   var _l = useState({ hist: true, median: true, floorCeil: true, simplePL: false, oscMedian: true, sigmaBand: true, forecast: true });
   var layers = _l[0]; var setLayers = _l[1];
@@ -552,8 +552,7 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
     <div>
     <svg ref={svgRef} viewBox={"0 0 " + W + " " + H} className="w-full" style={{ maxWidth: 720 }}
       onClick={function(e) { var yr = svgPointerYear(e); setChYear(chYear !== null && Math.abs((yr||0) - chYear) < 0.5 ? null : yr); }}
-      onMouseMove={function(e) { setChYear(svgPointerYear(e)); }}
-      onMouseLeave={function() { setChYear(null); }}>
+>
       <rect width={W} height={H} fill="#0f172a" rx="8" />
       {[2014,2016,2018,2020,2022,2024,2026,2028,2030,2032,2034].map(function(y) { return (<g key={y}><line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5" /><text x={xScale(y)} y={H-8} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>); })}
       {[100,1000,10000,100000,1000000].map(function(p) { return (<g key={p}><line x1={PAD.left} y1={yScale(p)} x2={PAD.left+plotW} y2={yScale(p)} stroke="#1e293b" strokeWidth="0.5" /><text x={PAD.left-5} y={yScale(p)+3} fill="#64748b" fontSize="8" textAnchor="end">{'$'+fmtS(p)}</text></g>); })}
@@ -641,7 +640,7 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
 
 function OscillationChart({ currentDate }) {
   var tNow = daysSinceGenesis(currentDate);
-  var startYear = 2013, endYear = 2036, POINTS = 400;
+  var startYear = 2013, endYear = 2036, POINTS = 150;
   var data = useMemo(function() {
     var r = [];
     for (var i = 0; i <= POINTS; i++) {
@@ -754,7 +753,7 @@ function PmiOverlayChart({ btcPrice, currentDate }) {
 // ---------------------------------------------------------------------------
 
 function PmiAdjustedFVChart({ btcPrice, currentDate }) {
-  var startYear=2018, endYear=2036, POINTS=300;
+  var startYear=2018, endYear=2036, POINTS=100;
   var curves = useMemo(function() {
     var med=[], adj=[], latPmi=getLatestPmi()[1];
     for (var i=0; i<=POINTS; i++) {
@@ -1085,7 +1084,7 @@ function BTCPowerLawMonitor() {
             </div>
           </Section>}
 
-          <Section id="sec-chart" title="Power Law Bands (log scale)">
+          <Section id="sec-chart" title="Power Law Bands (log scale)" defaultOpen={true}>
             <ZoomWrap><PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} /></ZoomWrap>
           </Section>
 
