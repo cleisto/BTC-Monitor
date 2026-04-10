@@ -814,11 +814,8 @@ export default function BTCPowerLawMonitor() {
   var _lu = useState(null); var lastUpdate = _lu[0]; var setLastUpdate = _lu[1];
   var _fs = useState('idle'); var fetchStatus = _fs[0]; var setFetchStatus = _fs[1];
   var _rh = useState([]); var ratioHistory = _rh[0]; var setRatioHistory = _rh[1];
-  var _th = useState('dark'); var theme = _th[0]; var setTheme = _th[1];
   var _pg = useState('dashboard'); var page = _pg[0]; var setPage = _pg[1];
   var _nv = useState(false); var navOpen = _nv[0]; var setNavOpen = _nv[1];
-
-  var isDark = theme === 'dark';
 
   var fetchPrice = useCallback(function() {
     setFetchStatus('loading');
@@ -945,21 +942,20 @@ export default function BTCPowerLawMonitor() {
   var metCount = conditions.filter(function(c){return c.met;}).length;
   var readinessLabel = metCount >= 5 ? 'Peak close' : metCount >= 4 ? 'Build-up' : metCount >= 2 ? 'Early cycle' : 'Accumulation';
 
-  var bg = isDark ? 'bg-slate-950' : 'bg-gray-50';
-  var cardBg = isDark ? 'bg-slate-900' : 'bg-white';
-  var cardBdr = isDark ? 'border-slate-800' : 'border-gray-200';
-  var txt2 = isDark ? 'text-slate-400' : 'text-gray-500';
-  var txt3 = isDark ? 'text-slate-600' : 'text-gray-400';
-  var inputCls = isDark ? 'bg-slate-800 border-slate-700 text-white' : 'bg-gray-50 border-gray-300 text-gray-900';
+  var bg = 'bg-slate-950';
+  var cardBg = 'bg-slate-900';
+  var cardBdr = 'border-slate-800';
+  var txt2 = 'text-slate-400';
+  var txt3 = 'text-slate-600';
+  var inputCls = 'bg-slate-800 border-slate-700 text-white';
 
   return (
-    <div className={"min-h-screen p-4 " + bg + (isDark ? " text-white" : " text-gray-900")} style={{fontFamily:'system-ui, -apple-system, sans-serif'}}>
+    <div className={"min-h-screen p-4 " + bg + " text-white"} style={{fontFamily:'system-ui, -apple-system, sans-serif'}}>
       <div className="max-w-3xl mx-auto space-y-4">
 
         <div className="text-center space-y-2">
           <div className="flex items-center justify-center gap-2">
             <h1 className="text-2xl font-bold text-amber-400">BTC Power Law Monitor</h1>
-            <button onClick={function(){setTheme(isDark?'light':'dark');}} className={"px-2 py-1 rounded-lg text-xs " + (isDark?'bg-slate-800 text-slate-400':'bg-gray-200 text-gray-600')}>{isDark ? 'Light' : 'Dark'}</button>
           </div>
           <div className="flex items-center justify-center gap-1">
             {['dashboard','btcpedia'].map(function(tab) {
@@ -967,9 +963,9 @@ export default function BTCPowerLawMonitor() {
             })}
           </div>
           {page === 'dashboard' && <div className="relative inline-block">
-            <button onClick={function(){setNavOpen(!navOpen);}} className={"text-xs px-3 py-1 rounded-lg " + (isDark?'bg-slate-800 text-slate-400 border border-slate-700':'bg-gray-100 text-gray-500 border border-gray-200')}>Jump to section v</button>
-            {navOpen && <div className={"absolute left-1/2 mt-1 border rounded-lg shadow-lg z-50 py-1 min-w-48 " + (isDark?'bg-slate-800 border-slate-700':'bg-white border-gray-200')} style={{transform:'translateX(-50%)'}}>
-              {navSections.map(function(s){return <button key={s.id} onClick={function(){scrollTo(s.id);}} className={"block w-full text-left px-3 py-1.5 text-xs " + (isDark?'text-slate-300 hover:bg-slate-700':'text-gray-700 hover:bg-gray-50')}>{s.label}</button>;})}
+            <button onClick={function(){setNavOpen(!navOpen);}} className={"text-xs px-3 py-1 rounded-lg " + 'bg-slate-800 text-slate-400 border border-slate-700'}>Jump to section v</button>
+            {navOpen && <div className={"absolute left-1/2 mt-1 border rounded-lg shadow-lg z-50 py-1 min-w-48 " + 'bg-slate-800 border-slate-700'} style={{transform:'translateX(-50%)'}}>
+              {navSections.map(function(s){return <button key={s.id} onClick={function(){scrollTo(s.id);}} className={"block w-full text-left px-3 py-1.5 text-xs " + 'text-slate-300 hover:bg-slate-700'}>{s.label}</button>;})}
             </div>}
           </div>}
         </div>
@@ -1032,9 +1028,9 @@ export default function BTCPowerLawMonitor() {
           </div>
 
           <div id="sec-proj" className={cardBg+" rounded-xl p-4 border "+cardBdr}>
-            <h2 className={"text-sm font-semibold mb-2 "+(isDark?'text-slate-300':'text-gray-700')}>Fair Value Projections</h2>
+            <h2 className={"text-sm font-semibold mb-2 text-slate-300"}>Fair Value Projections</h2>
             <table className="w-full text-sm"><thead><tr className={"text-xs uppercase "+txt3}><th className="text-left py-1 px-2">Horizon</th><th className="text-right py-1 px-2">Floor</th><th className="text-right py-1 px-2">Median</th><th className="text-right py-1 px-2">Ceiling</th></tr></thead>
-            <tbody>{projections.map(function(p,i){return <tr key={i} className={i%2===0?(isDark?'bg-slate-800/30':'bg-gray-50'):''}><td className="py-1 px-2">{p.label}</td><td className="py-1 px-2 text-right font-mono text-green-400 text-xs">{fmt(p.floor)}</td><td className="py-1 px-2 text-right font-mono text-amber-400 text-xs font-semibold">{fmt(p.median)}</td><td className="py-1 px-2 text-right font-mono text-red-400 text-xs">{fmt(p.ceiling)}</td></tr>;})}</tbody></table>
+            <tbody>{projections.map(function(p,i){return <tr key={i} className={i%2===0?'bg-slate-800/30':''}><td className="py-1 px-2">{p.label}</td><td className="py-1 px-2 text-right font-mono text-green-400 text-xs">{fmt(p.floor)}</td><td className="py-1 px-2 text-right font-mono text-amber-400 text-xs font-semibold">{fmt(p.median)}</td><td className="py-1 px-2 text-right font-mono text-red-400 text-xs">{fmt(p.ceiling)}</td></tr>;})}</tbody></table>
           </div>
 
           {showOscillation && <Section id="sec-cycle" title="Cycle Position" borderColor="border-purple-900/30">
@@ -1043,7 +1039,7 @@ export default function BTCPowerLawMonitor() {
           </Section>}
 
           {showOscillation && peakYear && <Section id="sec-timing" title={"Cycle Timing - " + metCount + "/6 - " + readinessLabel} borderColor="border-purple-900/30">
-            <div className={(isDark?'bg-slate-800/60':'bg-gray-50')+" rounded-lg p-3 flex items-center justify-between"}>
+            <div className={"bg-slate-800/60 rounded-lg p-3 flex items-center justify-between"}>
               <div>
                 <p className={"text-xs uppercase "+txt3}>Next Peak Window</p>
                 <p className="text-lg font-bold text-green-400">{(peakMo-3>0?peakMo-3:peakMo-3+12)+'/'+(peakMo-3>0?peakYr:peakYr-1)} - {(peakMo+3>12?peakMo+3-12:peakMo+3)+'/'+(peakMo+3>12?peakYr+1:peakYr)}</p>
@@ -1055,7 +1051,7 @@ export default function BTCPowerLawMonitor() {
               </div>
             </div>
             <div className="space-y-1.5">
-              {conditions.map(function(c,i){return <div key={i} className={"flex items-center justify-between px-3 py-2 rounded-lg text-sm "+(c.met?(isDark?'bg-slate-800/80':'bg-gray-100'):(isDark?'bg-slate-800/30':'bg-gray-50/50'))}>
+              {conditions.map(function(c,i){return <div key={i} className={"flex items-center justify-between px-3 py-2 rounded-lg text-sm "+(c.met?'bg-slate-800/80':'bg-slate-800/30')}>
                 <div className="flex items-center gap-2">
                   <div className={"w-3 h-3 rounded-full "+(c.met?'bg-green-500':'border border-slate-600')} />
                   <span className={c.met?'text-slate-200':'text-slate-500'}>{c.label}</span>
@@ -1096,7 +1092,7 @@ export default function BTCPowerLawMonitor() {
             <div className="grid grid-cols-4 gap-2">
               {['risk_on','rotation','risk_off','safe_haven'].map(function(key) {
                 var info = regimeInfo[key], active = regime === key;
-                return <div key={key} className={"rounded-lg p-2.5 text-center " + (active ? (isDark?'bg-slate-800 ring-2':'bg-gray-50 ring-2') : 'opacity-40 ' + (isDark?'bg-slate-800/30':'bg-gray-50/50'))} style={active?{boxShadow:'0 0 12px '+info.color+'30'}:{}}>
+                return <div key={key} className={"rounded-lg p-2.5 text-center " + (active ? 'bg-slate-800 ring-2' : 'opacity-40 bg-slate-800/30')} style={active?{boxShadow:'0 0 12px '+info.color+'30'}:{}}>
                   <div className="text-lg mb-0.5" style={{color:active?info.color:'#475569'}}>{info.icon}</div>
                   <p className="text-xs font-bold" style={{color:active?info.color:'#475569'}}>{info.label}</p>
                   {active && <p className={"text-xs mt-1 "+txt3}>{(regimeDiff>=0?'+':'')+regimeDiff.toFixed(1)+'%'}</p>}
@@ -1110,7 +1106,7 @@ export default function BTCPowerLawMonitor() {
             <div className="space-y-1.5">
               {takeProfits.map(function(tp,i) {
                 var isAct = btcPrice >= tp.price;
-                return <div key={i} className={"flex items-center justify-between px-3 py-2 rounded-lg text-sm "+(isAct?'bg-red-900/30 border border-red-800/50':(isDark?'bg-slate-800/50':'bg-gray-50'))}>
+                return <div key={i} className={"flex items-center justify-between px-3 py-2 rounded-lg text-sm "+(isAct?'bg-red-900/30 border border-red-800/50':'bg-slate-800/50')}>
                   <div className="flex items-center gap-2">
                     <div className={"w-2 h-2 rounded-full "+(isAct?'bg-red-400':'bg-slate-600')} />
                     <span className={isAct?'text-red-300':txt2}>{tp.level}</span>
@@ -1124,7 +1120,7 @@ export default function BTCPowerLawMonitor() {
             </div>
           </Section>
 
-          <div className={(isDark?'bg-slate-800/50':'bg-gray-100')+" rounded-xl p-4 text-xs "+txt3+" space-y-2"}>
+          <div className={"bg-slate-800/50 rounded-xl p-4 text-xs "+txt3+" space-y-2"}>
             <p className={"font-semibold "+txt2}>Three-Layer Model + Macro Overlay</p>
             <p><span className="text-amber-500 font-semibold">Layer 1 - Trend:</span> Decay Power Law d=0.029. $101k median, $56k floor, $160k ceiling.</p>
             <p><span className="text-purple-500 font-semibold">Layer 2 - Oscillation:</span> Log-periodic with amp decay. w=8.894, lambda=2.03, delta=0.684. R2=0.605. +/-1sigma band.</p>
@@ -1138,7 +1134,7 @@ export default function BTCPowerLawMonitor() {
           <p className={"text-sm text-center "+txt2}>Background knowledge - scientifically grounded, clearly explained.</p>
 
           <Section title="Why Genesis? (t0 = Jan 3, 2009)" defaultOpen={true}>
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>Optimizing t0 as a free parameter improves R2 from 0.9613 to 0.9628 - a gain of just 0.15%, well within bootstrap confidence bands. But the exponent drifts from 5.69 to 5.09, 13.8% away from the independent SSA benchmark (5.9).</p>
               <p><strong>Three independent methods converge:</strong> SSA eigenmode: 5.9 | Standard regression: 5.69 at t0=Genesis | Nonlinear optimization: 5.69 at t0=0 | Our decay model: 5.60 (lower due to d=0.029).</p>
               <p>Occam's Razor: any origin within +/-200 days of Genesis produces identical fits. The simplest model wins.</p>
@@ -1146,7 +1142,7 @@ export default function BTCPowerLawMonitor() {
           </Section>
 
           <Section title="Why the 4-year cycle is wrong">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>The scaling factor lambda = 2.03 means each cycle is roughly double the previous - not that all are 4 years. The sequence (~2, ~4, ~4, ~7 years) looks like "4 years" by coincidence.</p>
               <p>Confirmed by 5 independent tests: Fourier, Wavelet, Peak timing, Trough timing, Lomb-Scargle. Plus Hurst R/S and DFA (Perrenod 2026).</p>
               <p><strong>Consequence:</strong> Those expecting a 2025 peak (4 years after 2021) were wrong. Peak window: H2 2027 - H1 2028 (+/-3 months MAE).</p>
@@ -1154,42 +1150,42 @@ export default function BTCPowerLawMonitor() {
           </Section>
 
           <Section title="Why Decay? (d = 0.029)">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>8 independent decay functions converge on d = 0.029 at the median. The optimizer freely rejected d = 0. Jacobian correction w(t) = 1/t ensures true scale invariance.</p>
               <p><strong>Practical effect:</strong> Simple PL projects $118k today, our decay model $101k - a ~17% difference that grows over time. At 5 years: $542k vs $375k. Decay is more conservative and more honest.</p>
             </div>
           </Section>
 
           <Section title="The Hidden Coupling Constant (C = 3.96)">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>C = K * ln(lambda) = 5.60 * ln(2.027) = 3.96. Growth rate and cycle structure emerge from the same mathematical mechanism - they are not independent.</p>
               <p>exp(C) = 52. Each completed cycle raises the structural floor by ~52x. Two independent models converge on C = 3.96-3.97.</p>
             </div>
           </Section>
 
           <Section title="Why R2 is often misleading">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>Many BTC models advertise R2 &gt; 0.95. This is often misleading. Market Cap = Price x Supply, and Supply is a smooth deterministic function. The power law absorbs this trivially, inflating R2 to ~0.97.</p>
               <p>Our R2 values refer to ln(Price) - the more honest basis. R2 between different baselines is not comparable (different residuals = different y-variables).</p>
             </div>
           </Section>
 
           <Section title="Gold to BTC: The Lead Effect">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>Gold bull runs precede BTC bull runs. The lag shrinks: 428 days (2011-2013), 243 days (2016-2017), 63 days (2020-2021). Consistent with increasing institutionalization.</p>
               <p><strong>Limitation:</strong> Three data points. Post-hoc marked phases. Useful as qualitative context, not a standalone forecast model.</p>
             </div>
           </Section>
 
           <Section title="ISM PMI: Why the business cycle moves BTC">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>The BTC-PMI relationship is strengthening: R2 = 0.18 (2010-2018) to R2 = 0.51 (2018-2025). All four historical BTC peaks occurred with PMI 55-61 (avg 58). At 3/4 peaks, PMI was declining from a high.</p>
               <p>Peak conditions: PMI at peak 55-61 | PMI 12M high &gt;= 57 | PMI rollover (high but declining, 3/4 cycles).</p>
             </div>
           </Section>
 
           <Section title="Three independent models - one result">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>Multiple research groups converge: Beta 5.60-5.69, omega 8.89-9.01, lambda 2.01-2.03, C = 3.96-3.97, Peak ~2028.</p>
               <p>The elegant formulation: P = A * Re(t^(beta + i*omega)). Real part = trend, imaginary = oscillation. Same mechanism.</p>
               <p><strong>Our differentiator:</strong> Exponent decay (d=0.029) + amplitude decay (delta=0.684) = more conservative projections (~$265k vs ~$400k+ for 2028 peak).</p>
@@ -1197,7 +1193,7 @@ export default function BTCPowerLawMonitor() {
           </Section>
 
           <Section title="Amplitude Decay: Why cycles are shrinking">
-            <div className={"text-sm space-y-3 "+(isDark?'text-slate-300':'text-gray-700')}>
+            <div className={"text-sm space-y-3 "+'text-slate-300'}>
               <p>Historical amplitudes: 2011: 0.62 dex (4.2x over trend) | 2013: 0.40 dex (2.5x) | 2017: 0.22 dex (1.7x) | 2021: 0.16 dex (1.4x). Projection 2028: 0.12 dex (1.3x).</p>
               <p>Bitcoin is becoming more efficient: institutional participants, ETFs since 2024, deeper liquidity. Models without amplitude decay project $400-500k for 2028. Ours says ~$265k.</p>
             </div>
