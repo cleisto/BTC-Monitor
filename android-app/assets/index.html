@@ -346,8 +346,15 @@ function ValueGauge({ ratio }) {
 }
 
 function ZoomWrap({ children }) {
-  var _z = useState({ scale: 1, cx: 360, cy: 190 }); var zm = _z[0]; var setZm = _z[1];
+  var _z = useState(function() { return { scale: 1, cx: 360, cy: 190 }; }); var zm = _z[0]; var setZm = _z[1];
   var containerRef = useRef(null);
+  function getOrigVB() {
+    if (!containerRef.current) return { w: 720, h: 380 };
+    var svg = containerRef.current.querySelector('svg');
+    var vb = svg ? (svg.getAttribute('data-orig-vb') || svg.getAttribute('viewBox')) : null;
+    if (vb) { var p = vb.split(' ').map(Number); return { w: p[2], h: p[3] }; }
+    return { w: 720, h: 380 };
+  }
   var gestRef = useRef({ dist0: 0, scale0: 1, cx0: 0, cy0: 0, midX0: 0, midY0: 0, pinching: false, panning: false, px0: 0, py0: 0 });
   var zoomed = zm.scale > 1.05;
 
@@ -403,27 +410,23 @@ function ZoomWrap({ children }) {
       var d = getDist(e);
       var ns = Math.min(6, Math.max(1, g.scale0 * d / g.dist0));
       var rect = containerRef.current.getBoundingClientRect();
-      var svg0 = containerRef.current.querySelector('svg');
-      var orig = svg0 ? svg0.getAttribute('data-orig-vb') : '0 0 720 380';
-      var parts = orig.split(' ').map(Number);
+      var vb = getOrigVB();
       var mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       var my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-      var dxSvg = (mx - g.midX0) / rect.width * (parts[2] / g.scale0);
-      var dySvg = (my - g.midY0) / rect.height * (parts[3] / g.scale0);
+      var dxSvg = (mx - g.midX0) / rect.width * (vb.w / g.scale0);
+      var dySvg = (my - g.midY0) / rect.height * (vb.h / g.scale0);
       setZm({ scale: ns, cx: g.cx0 - dxSvg, cy: g.cy0 - dySvg });
     } else if (g.panning && e.touches.length === 1 && zm.scale > 1) {
       e.preventDefault();
       var rect2 = containerRef.current.getBoundingClientRect();
-      var svg1 = containerRef.current.querySelector('svg');
-      var orig2 = svg1 ? svg1.getAttribute('data-orig-vb') : '0 0 720 380';
-      var p2 = orig2.split(' ').map(Number);
-      var dx = (e.touches[0].clientX - g.px0) / rect2.width * (p2[2] / zm.scale);
-      var dy = (e.touches[0].clientY - g.py0) / rect2.height * (p2[3] / zm.scale);
+      var vb2 = getOrigVB();
+      var dx = (e.touches[0].clientX - g.px0) / rect2.width * (vb2.w / zm.scale);
+      var dy = (e.touches[0].clientY - g.py0) / rect2.height * (vb2.h / zm.scale);
       setZm({ scale: zm.scale, cx: g.cx0 - dx, cy: g.cy0 - dy });
     }
   }
   function handleTE() { gestRef.current.pinching = false; gestRef.current.panning = false; }
-  function reset() { setZm({ scale: 1, cx: 360, cy: 190 }); }
+  function reset() { var vb = getOrigVB(); setZm({ scale: 1, cx: vb.w / 2, cy: vb.h / 2 }); }
 
   return (
     <div ref={containerRef} className="relative rounded-lg" style={{ touchAction: zoomed ? 'none' : 'pan-y' }}
@@ -551,7 +554,7 @@ function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
 
   return (
     <div>
-    <svg ref={svgRef} viewBox={"0 0 " + W + " " + H} className="w-full" style={{ maxWidth: 720 }}
+    <svg ref={svgRef} viewBox={"0 0 " + W + " " + H} className="w-full"
       onClick={function(e) { var yr = svgPointerYear(e); setChYear(chYear !== null && Math.abs((yr||0) - chYear) < 0.5 ? null : yr); }}
       onMouseMove={function(e) { setChYear(svgPointerYear(e)); }}
       onMouseLeave={function() { setChYear(null); }}>
@@ -677,7 +680,7 @@ function OscillationChart({ currentDate }) {
     if (c.osc<p.osc&&c.osc<n.osc&&c.osc<-0.02) { if (!mkrs.length||c.year-mkrs[mkrs.length-1].year>1.5) mkrs.push({year:c.year,osc:c.osc,type:'trough'}); }
   }
   return (
-    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full">
       <rect width={W} height={H} fill="#0f172a" rx="8" />
       {[2014,2016,2018,2020,2022,2024,2026,2028,2030,2032,2034].map(function(y){return (<g key={y}><line x1={xS(y)} y1={PAD.top} x2={xS(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5"/><text x={xS(y)} y={H-5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>);})}
       <line x1={PAD.left} y1={yS(0)} x2={PAD.left+plotW} y2={yS(0)} stroke="#475569" strokeWidth="1"/>
@@ -739,7 +742,7 @@ function PmiOverlayChart({ btcPrice, currentDate }) {
     pmiSegs.push({d:'M'+xS(data[si-1].year).toFixed(1)+','+yPmi(data[si-1].pmi).toFixed(1)+' L'+xS(data[si].year).toFixed(1)+','+yPmi(data[si].pmi).toFixed(1), color:above?'#22c55e':'#ef4444'});
   }
   return (
-    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full">
       <rect width={W} height={H} fill="#0f172a" rx="8"/>
       {[2014,2016,2018,2020,2022,2024,2026].map(function(y){return (<g key={y}><line x1={xS(y)} y1={PAD.top} x2={xS(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5"/><text x={xS(y)} y={H-5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>);})}
       <line x1={PAD.left} y1={yPmi(50)} x2={PAD.left+plotW} y2={yPmi(50)} stroke="#475569" strokeWidth="1" strokeDasharray="4,4"/>
@@ -779,7 +782,7 @@ function PmiAdjustedFVChart({ btcPrice, currentDate }) {
   var cp=function(d){return d.filter(function(v){return v.price>0;}).map(function(v,i){return (i===0?'M':'L')+xS(v.year).toFixed(1)+','+yS(v.price).toFixed(1);}).join(' ');};
   var histP=HISTORICAL_PRICES.filter(function(h){return h[0]>=startYear;}).map(function(h,i){return (i===0?'M':'L')+xS(h[0]).toFixed(1)+','+yS(h[1]).toFixed(1);}).join(' ');
   return (
-    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full">
       <rect width={W} height={H} fill="#0f172a" rx="8"/>
       {[2018,2020,2022,2024,2026,2028,2030,2032,2034].map(function(y){return (<g key={y}><line x1={xS(y)} y1={PAD.top} x2={xS(y)} y2={PAD.top+plotH} stroke="#1e293b" strokeWidth="0.5"/><text x={xS(y)} y={H-5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text></g>);})}
       {[1000,10000,100000,1000000].map(function(p){return (<g key={p}><line x1={PAD.left} y1={yS(p)} x2={PAD.left+plotW} y2={yS(p)} stroke="#1e293b" strokeWidth="0.5"/></g>);})}
@@ -812,7 +815,7 @@ function GoldBtcRatioChart({ ratioHistory, currentRatio }) {
   }
   var maPath=maData.map(function(d,i){return (i===0?'M':'L')+xS(d.ts).toFixed(1)+','+yS(d.ratio).toFixed(1);}).join(' ');
   return (
-    <svg viewBox={"0 0 "+W+" "+H} className="w-full" style={{maxWidth:720}}>
+    <svg viewBox={"0 0 "+W+" "+H} className="w-full">
       <rect width={W} height={H} fill="#0f172a" rx="8"/>
       <path d={path} fill="none" stroke="#fbbf24" strokeWidth="1.2" opacity="0.5"/>
       {maPath && <path d={maPath} fill="none" stroke="#fbbf24" strokeWidth="2"/>}
@@ -972,7 +975,7 @@ function BTCPowerLawMonitor() {
 
   return (
     <div className={"min-h-screen p-4 " + bg + " text-white"} style={{fontFamily:'system-ui, -apple-system, sans-serif'}}>
-      <div className="max-w-3xl mx-auto space-y-4">
+      <div className="max-w-5xl mx-auto space-y-4">
 
         <div className="text-center space-y-2">
           <div className="flex items-center justify-center gap-2">
